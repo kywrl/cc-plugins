@@ -49,15 +49,19 @@ function main() {
   const cacheMs = parseInt(env.CC_TOOLKIT_STATUSLINE_CACHE_MS || "45000", 10) || 45000;
   const prefix = env.CC_TOOLKIT_STATUSLINE_PREFIX != null ? env.CC_TOOLKIT_STATUSLINE_PREFIX : "⚡ ";
 
-  // ① 优先用缓存
-  let samples = null;
+  // ① 优先用缓存（最新一轮 + 统计样本）
+  let last = null;
+  let samples = [];
   const cached = sessionId ? core.readCache(sessionId, cacheMs) : null;
   if (cached) {
-    samples = cached.samples;
+    samples = cached.samples || [];
+    // lastRound 不走统计过滤，短回复也能显示；旧缓存没有这个字段时退回样本末条
+    last = cached.lastRound || samples[samples.length - 1] || null;
   } else if (input.transcript_path && fs.existsSync(input.transcript_path)) {
     // ② 缓存过期：只回放末尾 400KB
     const tracker = new core.SessionTracker(input.transcript_path).start({ replayTailBytes: 400_000 });
-    samples = tracker.recentSamples(); // 收尾后的视图：含刚结束但未被归档的最后一轮
+    samples = tracker.recentSamples();
+    last = tracker.latestRound();
     if (sessionId) {
       try {
         core.writeCache(sessionId, tracker.snapshot());
@@ -67,9 +71,7 @@ function main() {
     }
   }
 
-  if (!samples || !samples.length) process.exit(0);
-
-  const last = samples[samples.length - 1];
+  if (!last) process.exit(0);
   if (last.tokens < minTokens) process.exit(0);
 
   const mark = last.estimated ? "≈" : "";

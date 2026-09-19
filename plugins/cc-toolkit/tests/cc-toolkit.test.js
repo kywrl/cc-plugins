@@ -561,6 +561,119 @@ test("cc-install-hook: 生成的命令能被 bash 正确解析（语法自洽）
   assert.equal(res.status, 0, `bash 语法检查失败: ${res.stderr}`);
 });
 
+test("SessionTracker: 短回复不进统计样本，但仍能被 latestRound 读到", () => {
+  // 回归测试：曾经统计过滤器（MIN_SAMPLE_TOKENS=50）会把短轮次整个丢掉，
+  // 导致 hook 取不到本轮读数 —— 用户设的 CC_TOOLKIT_MIN_TOKENS 形同虚设。
+  const file = writeTranscript([
+    { id: "short_1", ms: 2400, tokens: 46 }, // 「你好」量级：< 50，会被归档
+    { id: "short_2", ms: 2000, tokens: 400 }, // 触发对 short_1 的归档，自己留作当前轮
+  ]);
+  const tracker = new core.SessionTracker(file).start();
+
+  // short_1 已被归档，但太小 → 不进统计样本；short_2 还是当前轮，尚未归档
+  assert.equal(tracker.samples.length, 0, "46 token 的轮次不该进统计样本");
+
+  // 但 latestRound 必须能拿到最新一轮（当前轮 short_2）
+  const r = tracker.latestRound({ force: true });
+  assert.ok(r, "latestRound 必须返回最新一轮");
+  assert.equal(r.tokens, 400);
+});
+
+test("SessionTracker: latestRound 在会话只有一条短回复时也能返回它", () => {
+  const file = writeTranscript([{ id: "only", ms: 2400, tokens: 46 }]);
+  const tracker = new core.SessionTracker(file).start();
+
+  assert.equal(tracker.samples.length, 0, "短轮次不进统计样本");
+  assert.equal(tracker.recentSamples(undefined, { force: true }).length, 0, "统计视图也为空");
+
+  const r = tracker.latestRound({ force: true });
+  assert.ok(r, "即便统计视图为空，本轮读数也必须拿得到");
+  assert.equal(r.tokens, 46);
+  assert.equal(r.durMs, 2400);
+  assert.equal(Math.round(r.tps), 19);
+  assert.equal(r.estimated, false);
+});
+
+test("SessionTracker: latestRound 丢弃无 token 或零耗时的轮次", () => {
+  const file = writeTranscript([{ id: "tiny", ms: 100, tokens: 0.5 }]);
+  const tracker = new core.SessionTracker(file).start();
+  const r = tracker.latestRound({ force: true });
+  assert.equal(r, null, "token 不足 1 的轮次没有可报告的速度");
+});
+
+test("SessionTracker: 已归档的短轮次也会被 lastRound 记住", () => {
+  // 短轮次归档时该记进 lastRound；之后每归档一轮就覆盖它。
+  const file = writeTranscript([
+    { id: "short", ms: 2400, tokens: 46 }, // 归档（太小，不进样本）
+    { id: "big", ms: 2000, tokens: 400 }, // 归档（进样本），覆盖 lastRound
+    { id: "big2", ms: 2000, tokens: 500 }, // 当前轮，未归档
+  ]);
+  const tracker = new core.SessionTracker(file).start();
+
+  assert.equal(tracker.lastRound.tokens, 400, "lastRound 应指向最新归档的那条");
+  assert.deepEqual(
+    tracker.samples.map((d) => d.tokens),
+    [400],
+    "统计样本只收够大的 big"
+  );
+
+  // 当前轮（big2）优先于 lastRound
+  assert.equal(tracker.latestRound({ force: true }).tokens, 500);
+});
+
+test("hook: 短回复（低于统计下限但高于 CC_TOOLKIT_MIN_TOKENS）仍会报告", () => {
+  // 回归测试：46 tok 的「你好」回复应被报告，而不是静默
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 46 }], { name: "short-session.jsonl" });
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: "s", transcript_path: file }),
+  });
+  assert.notEqual(out, "", "短回复不该静默");
+  const payload = JSON.parse(out);
+  assert.match(payload.systemMessage, /⚡ 本轮 19 tok\/s/);
+  assert.match(payload.systemMessage, /46 tok \/ 2\.4s/);
+});
+
+test("hook: CC_TOOLKIT_MIN_TOKENS 高于本轮时仍然静默", () => {
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 46 }]);
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ transcript_path: file }),
+    env: { CC_TOOLKIT_MIN_TOKENS: "100" },
+  });
+  assert.equal(out, "", "用户把下限调到 100，46 tok 就该静默");
+});
+
+test("statusline: 短回复也能显示读数", () => {
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 46 }], { name: "sl-short.jsonl" });
+  const out = run("cc-statusline.js", [], {
+    input: JSON.stringify({ session_id: "sl-short", transcript_path: file }),
+  });
+  assert.match(out, /⚡ 19 tok\/s/, "状态栏不该因统计过滤而空掉");
+});
+
+test("snapshot: 缓存里带 lastRound，且不经统计过滤", () => {
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 46 }]);
+  const tracker = new core.SessionTracker(file).start();
+  const snap = tracker.snapshot({ force: true });
+
+  assert.deepEqual(snap.samples, [], "统计样本为空");
+  assert.ok(snap.lastRound, "但 lastRound 必须在");
+  assert.equal(snap.lastRound.tokens, 46);
+});
+
+test("statusline: 旧版缓存（无 lastRound 字段）仍能读出读数", () => {
+  const id = `legacy-${Math.random().toString(36).slice(2)}`;
+  // 模拟旧版写的缓存：只有 samples，没有 lastRound
+  core.writeCache(id, {
+    v: 1,
+    at: Date.now(),
+    samples: [{ tokens: 400, durMs: 2000, tps: 200, estimated: false, at: Date.now() }],
+  });
+
+  const out = run("cc-statusline.js", [], { input: JSON.stringify({ session_id: id }) });
+  assert.match(out, /⚡ 200 tok\/s/, "应回退到 samples 末条");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
 // ── 端到端：CLI ─────────────────────────────────────────────────────────
 
 test("CLI --report: 输出含表头、样本行与统计事实", () => {

@@ -87,24 +87,27 @@ async function main() {
     attempt(attempts);
   });
 
-  // 收尾后取样本：本轮可能已在此期间被归档（下一轮开始了），统一从同一个视图取
-  const rows = tracker.recentSamples(undefined, { force: true });
-  if (!rows.length) return silent("没有可报告的轮次");
+  // 取本轮读数：用 latestRound（不走统计过滤器），否则短回复会被
+  // MIN_SAMPLE_TOKENS=50 吃掉，用户设的 CC_TOOLKIT_MIN_TOKENS 就形同虚设。
+  // force=true —— Stop 事件本身就是「本轮已结束」的信号，不必再等流式窗口。
+  const round = tracker.latestRound({ force: true });
+  if (!round) return silent("没有可报告的轮次");
 
-  const last = rows[rows.length - 1];
-  const tokens = last.tokens;
-  const durMs = last.durMs;
-  const estimated = last.estimated;
-  const priorTps = rows.slice(0, -1).slice(-9).map((d) => d.tps);
+  const tokens = round.tokens;
+  const durMs = round.durMs;
+  const estimated = round.estimated;
 
   if (tokens < minTokens) return silent(`样本太小 (${Math.round(tokens)} < ${minTokens} tok)`);
   if (!(durMs > 0)) return silent("耗时无效");
 
-  const tps = tokens / (durMs / 1000);
+  const tps = round.tps;
   const slowThreshold = parseFloat(env.CC_TOOLKIT_SLOW_TOKENS_PER_SEC || "20") || 20;
   if (env.CC_TOOLKIT_QUIET === "1" && tps >= slowThreshold) {
     return silent(`QUIET 模式，速度正常 (${tps.toFixed(0)} tok/s)`);
   }
+
+  // 中位数只由通过统计过滤的样本参与（本轮即便太小也不影响它）
+  const priorTps = tracker.samples.slice(-9).map((d) => d.tps);
 
   const mark = estimated ? "≈" : "";
   const med = core.median(priorTps);

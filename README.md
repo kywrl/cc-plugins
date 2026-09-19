@@ -139,37 +139,10 @@ node /path/to/cc-toolkit/plugins/cc-toolkit/scripts/cc-watch.js --once
 
 ## hooks 配置方法
 
-这是本插件的核心。**先读下面这条重要前提，再按情况选一种配法。**
+这是本插件的核心。**默认什么都不用配**——插件自带的 `hooks/hooks.json` 会由
+Claude Code 自动加载。只有在下面这种少数情况下才需要手工挂。
 
-### ⚠️ 重要前提：第三方 provider 下插件 hook 不生效
-
-如果你用第三方 `ANTHROPIC_BASE_URL`（中转网关、自建代理等），Claude Code 会关闭
-GrowthBook 灰度服务，而 `tengu_plugin_hooks_modules`——控制「**已安装插件**的 hook
-是否生效」的开关——**默认值就是 off**，拿不到下发值，于是插件自带的
-`hooks/hooks.json` 不会被注册执行。
-
-Claude Code 的调试日志里会明确写出来：
-
-```
-[DEBUG] Read hooks.json for plugin cc-toolkit (enabled=true): ...\hooks\hooks.json
-[DEBUG] installed plugins' hooks modules not loaded: rollout flag
-        (tengu_plugin_hooks_modules) is off, from the default
-        (GrowthBook is off for this session: a third-party provider, or telemetry opted out);
-        built-in plugins load regardless
-[DEBUG] Loading hooks from plugin: cc-toolkit
-```
-
-注意最后那行——hook 文件**被读取了**，但前面那行说明它没被挂到执行器上。
-`built-in plugins load regardless` 是官方内置插件的豁免，第三方插件没有。
-
-**如果你用的是官方 provider（直接连 Anthropic），A 节开箱即用，可以跳过本节。**
-
-第三方 provider 用户请直接用下面的 **B 节**（一条命令搞定），或者手工配。
-
-> 这不是插件的 bug，是 Claude Code 当前的灰度门控行为。斜杠命令、skill、
-> `--plugin-dir` 加载都走别的通路，不受影响——只有「已安装插件的 hook」被挡。
-
-### A. 用插件安装 —— 官方 provider 下自动生效
+### A. 用插件安装 —— 默认就是这条，无需配置
 
 插件的 [hooks/hooks.json](plugins/cc-toolkit/hooks/hooks.json) 会被 Claude Code 自动加载，内容就是：
 
@@ -206,7 +179,25 @@ Claude Code 的调试日志里会明确写出来：
 > Stop hook 的 `decision: "block"` + `reason` 是"阻止 Claude 停下"的控制信号，会把内容喂给模型；
 > `hookSpecificOutput.additionalContext` 同样是给模型的。只有 `systemMessage` 是纯净的用户侧提示。
 
-### B. 手工挂进 settings.json —— 第三方 provider 用户用这个
+### B. 手工挂进 settings.json —— 少数情况才需要
+
+**什么时候需要**：插件 hook 没生效时。先确认是不是真的没生效——
+hook 每次执行都会写一份状态缓存 `<临时目录>/cc-toolkit-<会话id>.json`，
+看它的修改时间就知道。
+
+已知会让插件 hook 失效的情况：某些环境下 Claude Code 的 `tengu_plugin_hooks_modules`
+灰度开关为 off（调试日志里写 `installed plugins' hooks modules not loaded`），
+此时「已安装插件的 hook」不会被注册执行。
+
+⚠️ **别照抄调试日志下结论。** 这个开关是**按进程**决定的：`claude -p` 之类的
+CLI 子进程与桌面版长期运行的进程可能状态不同。要判断你的实际环境，
+请在**你真正使用的那个进程**里看 `stop_hook_summary` 记录
+（transcript 里搜这个字段，`hookInfos` 会列出真正执行过的命令）。
+
+**另一种情况**：你已经有别的 Stop hook，想统一管理，都放到 `settings.json` 里。
+
+> ⚠️ 挂完之后**不要两个都留**——插件自带的 `hooks/hooks.json` 和 `settings.json`
+> 里这条会各执行一次，每轮出现**两条**读数。要用这条就先把插件的关掉。
 
 #### B-1. 一条命令搞定（推荐）
 
@@ -276,7 +267,7 @@ Claude Code 的调试日志里会明确写出来：
 
 ### 挂上之后怎么验证
 
-1. 让 Claude 回一句有实质内容的话（输出太短会被 `CC_TOOLKIT_MIN_TOKENS` 过滤，默认 30 tok）；
+1. 让 Claude 回一句有实质内容的话（低于 `CC_TOOLKIT_MIN_TOKENS` 会被跳过，默认 30 tok）；
 2. 回复结束后应看到 `⚡ 本轮 … tok/s`；
 3. 没看到就调试：
 
@@ -297,7 +288,7 @@ echo '{"session_id":"t","transcript_path":"/path/to/session.jsonl","hook_event_n
 | `/cc-toolkit:tps [条数]` | 多行快照：当前一轮 + 最近 N 条 + 中位/p90/最快/最慢 + 趋势与离群样本。参数默认 10，可加 `--all` 回放整个会话文件 |
 | `/cc-toolkit:tps-live [参数]` | 生成实时监视命令（前台长驻，Ctrl-C 退出）。可选 `--interval=500`、`-p 项目目录名` |
 | `/cc-toolkit:tps-doctor` | 环境自检：Node 版本、会话目录、能否定位当前会话、插件路径解析、hook / 状态栏该往哪配 |
-| `/cc-toolkit:install-hook` | 把 Stop hook 写进 `settings.json`（第三方 provider 用户需要）。`--print` 预览、`--uninstall` 移除、`--project` 写进当前项目 |
+| `/cc-toolkit:install-hook` | 把 Stop hook 写进 `settings.json`（插件 hook 没生效、或想统一管理 hook 时用）。`--print` 预览、`--uninstall` 移除、`--project` 写进当前项目 |
 
 命令行等价形式（不装插件也能用）：
 
@@ -383,7 +374,7 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
 | `CC_TOOLKIT_DISABLE` | — | 设为 `1` 完全禁用（hook 与状态栏都静默退出） |
-| `CC_TOOLKIT_MIN_TOKENS` | `30` | 低于该 token 数不报告，避免"嗯"一声也弹个数 |
+| `CC_TOOLKIT_MIN_TOKENS` | `30` | 低于该 token 数不报告，避免"嗯"一声也弹个数。**只作用于本轮读数**，不影响中位数等统计聚合 |
 | `CC_TOOLKIT_QUIET` | — | 设为 `1` 只在明显偏慢时才提示，平时安静 |
 | `CC_TOOLKIT_SLOW_TOKENS_PER_SEC` | `20` | QUIET 模式下的"慢"阈值 |
 | `CC_TOOLKIT_VERBOSE` | — | 设为 `1` 把诊断信息写到 stderr |
@@ -432,10 +423,8 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 
 **Q: 完全看不到任何输出**
 
-1. **先确认是不是第三方 provider**：查 `~/.claude/settings.json` 里的
-   `env.ANTHROPIC_BASE_URL`。指向中转网关/自建代理时，插件 hook 不生效
-   （原因见 [hooks 配置方法](#-重要前提第三方-provider-下插件-hook-不生效)），
-   跑 `/cc-toolkit:install-hook` 挂进 `settings.json` 即可。
+1. 先确认 hook 到底跑没跑——看状态缓存的修改时间：
+   `<临时目录>/cc-toolkit-<会话id>.json`（`%TEMP%` / `$TMPDIR`）；
 2. 跑 `/cc-toolkit:tps-doctor` 看环境（它会解析并打印当前定位到的插件目录）；
 3. 确认 Node 能跑：`node --version`；
 4. 手动喂一个假事件看 hook 的原始输出：
@@ -445,19 +434,31 @@ echo '{"session_id":"t","transcript_path":"C:/Users/me/.claude/projects/项目�
 ```
 
 5. 确认没被环境变量关掉：`CC_TOOLKIT_DISABLE` / `CC_TOOLKIT_QUIET`；
+6. 还是不行 → 按 [hooks 配置方法](#hooks-配置方法) B 节手工挂进 `settings.json`。
+
+**Q: 回复很短（比如只回一句"你好"）时没有读数？**
+
+这是**已经修掉的 bug**（v1.0.1）。旧版把统计过滤器（≥50 token）误用在
+「本轮读数」上，导致短回复在到达 hook 之前就被丢掉——即使你设置的
+`CC_TOOLKIT_MIN_TOKENS` 比它低也没用。
+
+现在统计过滤只影响中位数/p90 这类聚合，**不影响本轮读数的显示**。
+短回复按 `CC_TOOLKIT_MIN_TOKENS`（默认 30）判断，够了就会显示。
 
 **Q: 怎么确认 hook 到底跑没跑？**
 
 hook 每次执行都会往临时目录写一份状态缓存 `<tmp>/cc-toolkit-<会话id>.json`。
 看它的修改时间就知道有没有在跑（`%TEMP%` / `$TMPDIR`）。
 
-更彻底的办法是开调试日志 —— 这是确认「插件 hook 被灰度开关挡住」的唯一直接证据：
+想看得更细，检查 transcript 里的 `stop_hook_summary` 记录，它的 `hookInfos`
+列出了**真正执行过**的命令：
 
 ```bash
-claude --debug
+grep -o '"subtype":"stop_hook_summary"[^}]*' <会话文件>.jsonl | tail -3
 ```
 
-然后在输出里搜 `plugin_hooks_modules` 和 `Loading hooks from plugin`。
+这比看调试日志可靠——调试日志里的 `tengu_plugin_hooks_modules` 状态是**按进程**的，
+CLI 子进程与桌面版可能不同。
 
 **Q: 插件更新后 hook 失效了？**
 

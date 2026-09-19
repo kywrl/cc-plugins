@@ -158,7 +158,8 @@ class SessionTracker {
     this.lastTs = null; // 上一行（任意类型）的时间戳，作为新响应的起点
     this.groups = new Map(); // message.id -> 轮次统计
     this.currentId = null;
-    this.samples = []; // 已完成的响应样本
+    this.samples = []; // 已完成、且通过统计过滤的样本（供中位数/p90 等聚合）
+    this.lastRound = null; // 最新一轮（不过滤，供 hook / 状态栏读数）
     this.lastEventAt = 0; // 最后一次块落盘的本地时间，用于判断是否仍在流式
     this.parsedLines = 0;
     this.parseErrors = 0;
@@ -195,14 +196,22 @@ class SessionTracker {
 
     const tokens = this.tokensOf(g);
     const durMs = g.end - g.start;
+    const round = {
+      tokens,
+      estimated: g.out === 0,
+      durMs,
+      tps: durMs > 0 ? tokens / (durMs / 1000) : 0,
+      at: g.end,
+      start: g.start,
+    };
+
+    // 无论大小都记下「最后一轮」——它是 hook / 状态栏的读数来源，
+    // 不能被统计过滤器顺手丢掉（短回复也有速度，只是不适合进中位数）。
+    this.lastRound = round;
+
+    // 统计样本才需要过滤：太短的轮次方差极大，混进中位数/p90 会污染聚合结果。
     if (tokens >= MIN_SAMPLE_TOKENS && durMs > MIN_SAMPLE_MS) {
-      this.samples.push({
-        tokens,
-        estimated: g.out === 0,
-        durMs,
-        tps: tokens / (durMs / 1000),
-        at: g.end,
-      });
+      this.samples.push(round);
     }
     if (this.samples.length > MAX_SAMPLES) this.samples.shift();
   }
@@ -216,6 +225,39 @@ class SessionTracker {
   }
 
   /**
+   * 最新一轮的读数 —— **不套用统计过滤器**。
+   *
+   * 这是 hook 与状态栏该用的接口。统计过滤（MIN_SAMPLE_TOKENS / MIN_SAMPLE_MS）
+   * 只服务于中位数、p90 这类聚合，不该决定「本轮速度能不能显示」——
+   * 否则一条 46 token 的短回复会被 50 的阈值吃掉，用户设的
+   * CC_TOOLKIT_MIN_TOKENS 就形同虚设。
+   *
+   * @param {{force?: boolean, now?: number}} [opts]
+   *   force=true 表示「调用方确信本轮已结束」（Stop 事件就是这种信号），
+   *   此时不再等 3 秒的流式窗口。
+   * @returns {{tokens:number, estimated:boolean, durMs:number, tps:number, at:number, start:number}|null}
+   */
+  latestRound({ force = false, now = Date.now() } = {}) {
+    const g = this.currentGroup();
+    if (g && (force || now - g.end >= STREAMING_WINDOW_MS)) {
+      const tokens = this.tokensOf(g);
+      const durMs = g.end - g.start;
+      // 至少要有一个 token 和正的耗时，否则除零 / 无意义
+      if (tokens >= 1 && durMs > 0) {
+        return {
+          tokens,
+          estimated: g.out === 0,
+          durMs,
+          tps: tokens / (durMs / 1000),
+          at: g.end,
+          start: g.start,
+        };
+      }
+    }
+    return this.lastRound || null;
+  }
+
+  /**
    * 收尾：把「已经结束、但还没有下一轮来触发归档」的当前轮次也纳入统计视图。
    *
    * 最后一轮永远等不到下一个 message.id。如果不收尾，/cc-toolkit:tps 的统计和状态栏
@@ -223,6 +265,8 @@ class SessionTracker {
    *
    * 默认不修改 tracker 状态：只在返回的样本列表里追加当前轮，
    * 这样 tracker.currentSpeed() 仍然能报告「刚结束的这一轮」。
+   *
+   * 注意这里是**统计视图**，仍套用统计过滤器；要拿「本轮是多少」请用 latestRound()。
    *
    * @param {{force?: boolean, now?: number}} [opts]
    *   force=true 时无条件收尾（Stop 事件本身就是「本轮已结束」的信号）。
@@ -414,6 +458,8 @@ class SessionTracker {
       at: Date.now(),
       parsedLines: this.parsedLines,
       samples: this.finalizedSamples({ force }).slice(-MAX_SAMPLES),
+      // 最新一轮单独存：它不走统计过滤，短回复也能被状态栏读到
+      lastRound: this.latestRound({ force }),
     };
   }
 }

@@ -4,6 +4,28 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.1] - 2026-09-20
+
+### 修复
+
+- **短回复没有读数。** 统计过滤器（`MIN_SAMPLE_TOKENS = 50`）被误用在「本轮读数」上，
+  导致 50 token 以下的轮次在到达 hook 之前就被丢掉——即便用户设置的
+  `CC_TOOLKIT_MIN_TOKENS` 比它低也无效。典型症状：只回一句「你好」（实测 46 tok）
+  时完全静默。
+  现在统计过滤只影响中位数/p90 这类**聚合**，不再决定本轮能否显示；
+  本轮读数改用新的 `latestRound()`，只受 `CC_TOOLKIT_MIN_TOKENS` 约束。
+  状态栏同样受益（缓存新增 `lastRound` 字段，旧缓存仍兼容）。
+
+### 文档
+
+- **修正上一版关于「第三方 provider 下插件 hook 不生效」的结论。** 该结论来自一个
+  `claude -p` CLI 子进程的调试日志，被错误地推广到了长期运行的桌面版进程。
+  实测（transcript 的 `stop_hook_summary` 记录）表明插件自带的 hook 在桌面版下正常工作。
+  `tengu_plugin_hooks_modules` 是**按进程**决定的，判断实际状态应看
+  `stop_hook_summary` 的 `hookInfos`，而不是照抄某次 CLI 运行的日志。
+- `hooks 配置方法` 改为「默认无需配置」，手工挂载一节降级为少数情况的备选方案，
+  并补上「不要两个 hook 都留，否则每轮两条读数」的警告。
+
 ## [1.0.0] - 2026-09-20
 
 首次发布。
@@ -25,13 +47,11 @@
 
 ### 已知限制与应对
 
-- **第三方 provider 下插件自带 hook 不生效。** 用 `ANTHROPIC_BASE_URL` 指向中转网关
-  或自建代理时，Claude Code 会关闭 GrowthBook 灰度服务，而
-  `tengu_plugin_hooks_modules`（控制「已安装插件的 hook 是否生效」的开关）默认值为
-  off，拿不到下发值 → 插件自带的 `hooks/hooks.json` 不会被注册执行
-  （内置插件有豁免，官方 provider 用户开箱即用）。
-  应对：用 `/cc-toolkit:install-hook` 或手工把 hook 挂进 `settings.json`。
-  **挂的仍然是插件里的脚本**，不是本地脚本。
+- **某些环境下插件自带的 hook 可能不生效**：Claude Code 的
+  `tengu_plugin_hooks_modules` 灰度开关为 off 时，「已安装插件的 hook」不会被注册执行。
+  该开关**按进程**决定，CLI 子进程与桌面版长期运行的进程可能状态不同。
+  应对：用 `/cc-toolkit:install-hook` 或手工把 hook 挂进 `settings.json`
+  （**挂的仍然是插件里的脚本**，不是本地脚本）。
 
 ### 设计要点
 
