@@ -61,7 +61,7 @@ cc-toolkit 从 Claude Code 自己写的会话日志里算出每一轮的真实�
 在本仓库发布后，于 Claude Code 里执行两条命令：
 
 ```bash
-/plugin marketplace add kywrl/claude-plugins
+/plugin marketplace add kywrl/cc-plugins
 ```
 
 ```bash
@@ -70,9 +70,6 @@ cc-toolkit 从 Claude Code 自己写的会话日志里算出每一轮的真实�
 
 第一条把本仓库注册为一个插件市场（`cc-plugins` 是 [marketplace.json](.claude-plugin/marketplace.json) 里声明的市场名），
 第二条安装插件。装完 Stop hook 自动生效，**不需要手工改 `settings.json`**。
-
-> 市场名不叫 `claude-plugins`：Claude Code 的校验器会把 `claude-*` 开头的市场名判为冒充官方市场并拒绝解析，
-> 所以仓库叫 `claude-plugins`，市场叫 `cc-plugins`。
 
 安装后会写入 `~/.claude/settings.json`（用户级作用域）：
 
@@ -419,7 +416,7 @@ echo '{"session_id":"t","transcript_path":"C:/Users/me/.claude/projects/项目�
 ## 仓库结构
 
 ```
-claude-plugins/                         # 仓库名
+cc-plugins/                             # 仓库名 = 市场名
 ├── .claude-plugin/
 │   └── marketplace.json              # 市场清单：市场名 cc-plugins
 ├── plugins/

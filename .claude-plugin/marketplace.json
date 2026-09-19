@@ -12,7 +12,7 @@
       "source": "./plugins/cc-toolkit",
       "description": "实时监控 Claude Code 的输出速度 (tok/s)。每轮回复结束后显示本轮速度与近期中位数，提供 /cc-toolkit:tps 查看历史分布与趋势，可选把读数放进状态栏。零 npm 依赖，全部数据在本地计算。",
       "category": "monitoring",
-      "homepage": "https://github.com/kywrl/claude-plugins/tree/main/plugins/cc-toolkit"
+      "homepage": "https://github.com/kywrl/cc-plugins/tree/main/plugins/cc-toolkit"
     }
   ]
 }

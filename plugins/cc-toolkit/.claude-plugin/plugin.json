@@ -6,8 +6,8 @@
     "name": "kywrl",
     "url": "https://github.com/kywrl"
   },
-  "homepage": "https://github.com/kywrl/cc-toolkit/tree/main/plugins/cc-toolkit",
-  "repository": "https://github.com/kywrl/cc-toolkit",
+  "homepage": "https://github.com/kywrl/cc-plugins/tree/main/plugins/cc-toolkit",
+  "repository": "https://github.com/kywrl/cc-plugins",
   "license": "MIT",
   "keywords": [
     "tps",
