@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 /**
- * tps-hook — Stop hook：每轮回复结束后，把本轮输出速度回吐给用户
+ * cc-hook — Stop hook：每轮回复结束后，把本轮输出速度回吐给用户
  *
  * 在 stdin 收到 Claude Code 的 Stop 事件 JSON，往 stdout 吐
  *   {"systemMessage": "⚡ 本轮 68 tok/s …"}
@@ -11,19 +11,19 @@
  * 绝不因为一个测速工具干扰正常会话。
  *
  * 环境变量:
- *   TPS_WATCH_DISABLE=1        完全禁用（等于没装这个 hook）
- *   TPS_WATCH_MIN_TOKENS=30    低于该 token 数不报告
- *   TPS_WATCH_QUIET=1          只在速度异常慢时才提示
- *   TPS_WATCH_SLOW_TOKENS_PER_SEC=20    QUIET 模式下的「慢」阈值
- *   TPS_WATCH_VERBOSE=1        把诊断信息写到 stderr（不影响 hook 协议）
+ *   CC_TOOLKIT_DISABLE=1        完全禁用（等于没装这个 hook）
+ *   CC_TOOLKIT_MIN_TOKENS=30    低于该 token 数不报告
+ *   CC_TOOLKIT_QUIET=1          只在速度异常慢时才提示
+ *   CC_TOOLKIT_SLOW_TOKENS_PER_SEC=20    QUIET 模式下的「慢」阈值
+ *   CC_TOOLKIT_VERBOSE=1        把诊断信息写到 stderr（不影响 hook 协议）
  */
 
 const fs = require("fs");
-const core = require("./tps-core");
+const core = require("./cc-core");
 
 const env = process.env;
-const VERBOSE = env.TPS_WATCH_VERBOSE === "1";
-const debug = (...a) => VERBOSE && console.error("[tps-watch]", ...a);
+const VERBOSE = env.CC_TOOLKIT_VERBOSE === "1";
+const debug = (...a) => VERBOSE && console.error("[cc-toolkit]", ...a);
 
 /** 安全输出 hook 协议 JSON 并退出 */
 function respond(payload) {
@@ -54,7 +54,7 @@ function readStdin() {
 }
 
 async function main() {
-  if (env.TPS_WATCH_DISABLE === "1") return silent("TPS_WATCH_DISABLE=1");
+  if (env.CC_TOOLKIT_DISABLE === "1") return silent("CC_TOOLKIT_DISABLE=1");
 
   const raw = await readStdin();
   let event = {};
@@ -71,7 +71,7 @@ async function main() {
   if (!tracker) return silent("定位不到会话文件");
 
   const sessionId = event.session_id || require("path").basename(tracker.file).replace(/\.jsonl$/, "");
-  const minTokens = parseInt(env.TPS_WATCH_MIN_TOKENS || "30", 10) || 30;
+  const minTokens = parseInt(env.CC_TOOLKIT_MIN_TOKENS || "30", 10) || 30;
 
   const targetId = tracker.currentId;
   const attempts = 4;
@@ -101,8 +101,8 @@ async function main() {
   if (!(durMs > 0)) return silent("耗时无效");
 
   const tps = tokens / (durMs / 1000);
-  const slowThreshold = parseFloat(env.TPS_WATCH_SLOW_TOKENS_PER_SEC || "20") || 20;
-  if (env.TPS_WATCH_QUIET === "1" && tps >= slowThreshold) {
+  const slowThreshold = parseFloat(env.CC_TOOLKIT_SLOW_TOKENS_PER_SEC || "20") || 20;
+  if (env.CC_TOOLKIT_QUIET === "1" && tps >= slowThreshold) {
     return silent(`QUIET 模式，速度正常 (${tps.toFixed(0)} tok/s)`);
   }
 
@@ -110,7 +110,7 @@ async function main() {
   const med = core.median(priorTps);
 
   let msg;
-  if (env.TPS_WATCH_QUIET === "1") {
+  if (env.CC_TOOLKIT_QUIET === "1") {
     msg = `🐢 本轮偏慢 ${mark}${tps.toFixed(0)} tok/s (${mark}${core.formatTokens(tokens)} tok / ${(durMs / 1000).toFixed(1)}s)`;
     if (med != null) msg += ` · 近${priorTps.length}条中位 ${med.toFixed(0)} tok/s`;
   } else {
@@ -130,6 +130,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("[tps-watch] hook 异常:", err && err.message);
+  console.error("[cc-toolkit] hook 异常:", err && err.message);
   process.exit(0); // 无论如何不要阻塞会话
 });

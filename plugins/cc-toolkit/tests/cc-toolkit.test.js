@@ -1,6 +1,6 @@
 "use strict";
 /**
- * 用 Node 内置测试运行器跑：node --test plugins/tps-watch/tests
+ * 用 Node 内置测试运行器跑：node --test plugins/cc-toolkit/tests
  * 零依赖，不需要 npm install。
  */
 
@@ -11,7 +11,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
-const core = require("../scripts/tps-core");
+const core = require("../scripts/cc-core");
 
 const SCRIPTS = path.join(__dirname, "..", "scripts");
 
@@ -20,7 +20,7 @@ const SCRIPTS = path.join(__dirname, "..", "scripts");
 let tmpRoot;
 
 test.before(() => {
-  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "tps-watch-test-"));
+  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cc-toolkit-test-"));
 });
 
 test.after(() => {
@@ -314,7 +314,7 @@ test("CLI --report: 输出含表头、样本行与统计事实", () => {
     { id: "msg_1", ms: 2000, tokens: 400 },
     { id: "msg_2", ms: 1000, tokens: 500 },
   ]);
-  const out = run("tps-watch.js", ["--report", "--history=5", file]);
+  const out = run("cc-watch.js", ["--report", "--history=5", file]);
 
   assert.match(out, /会话 \w+/);
   assert.match(out, /最近 2 条已完成的响应/);
@@ -325,7 +325,7 @@ test("CLI --report: 输出含表头、样本行与统计事实", () => {
 
 test("CLI --json: 是合法 JSON，且字段齐全", () => {
   const file = writeTranscript([{ id: "msg_1", ms: 2000, tokens: 400 }]);
-  const data = JSON.parse(run("tps-watch.js", ["--json", "--history=5", file]));
+  const data = JSON.parse(run("cc-watch.js", ["--json", "--history=5", file]));
 
   assert.equal(data.samples.length, 1);
   assert.equal(data.samples[0].tokens, 400);
@@ -336,14 +336,14 @@ test("CLI --json: 是合法 JSON，且字段齐全", () => {
 
 test("CLI --once: 单行输出", () => {
   const file = writeTranscript([{ id: "msg_1", ms: 2000, tokens: 400 }]);
-  const out = run("tps-watch.js", ["--once", file]);
+  const out = run("cc-watch.js", ["--once", file]);
   assert.equal(out.trim().split("\n").length, 1);
   assert.match(out, /tok\/s/);
 });
 
 test("CLI: 文件不存在时退出码非 0", () => {
   assert.throws(
-    () => run("tps-watch.js", ["--once", path.join(tmpRoot, "nope.jsonl")]),
+    () => run("cc-watch.js", ["--once", path.join(tmpRoot, "nope.jsonl")]),
     (err) => err.status === 1
   );
 });
@@ -355,7 +355,7 @@ test("hook: 收到事件后输出 {systemMessage}，且不含 extra 字段", () 
     Array.from({ length: 5 }, (_, i) => ({ id: `msg_${i}`, ms: 1500, tokens: 400 })),
     { name: "hook-session.jsonl" }
   );
-  const out = run("tps-hook.js", [], {
+  const out = run("cc-hook.js", [], {
     input: JSON.stringify({
       session_id: "sess-1",
       transcript_path: file,
@@ -373,52 +373,52 @@ test("hook: 收到事件后输出 {systemMessage}，且不含 extra 字段", () 
 
 test("hook: stop_hook_active 时静默，防止递归", () => {
   const file = writeTranscript([{ id: "m", ms: 2000, tokens: 400 }]);
-  const out = run("tps-hook.js", [], {
+  const out = run("cc-hook.js", [], {
     input: JSON.stringify({ transcript_path: file, stop_hook_active: true }),
   });
   assert.equal(out, "");
 });
 
-test("hook: TPS_WATCH_DISABLE=1 时静默", () => {
+test("hook: CC_TOOLKIT_DISABLE=1 时静默", () => {
   const file = writeTranscript([{ id: "m", ms: 2000, tokens: 400 }]);
-  const out = run("tps-hook.js", [], {
+  const out = run("cc-hook.js", [], {
     input: JSON.stringify({ transcript_path: file }),
-    env: { TPS_WATCH_DISABLE: "1" },
+    env: { CC_TOOLKIT_DISABLE: "1" },
   });
   assert.equal(out, "");
 });
 
-test("hook: TPS_WATCH_MIN_TOKENS 高于实际输出时静默", () => {
+test("hook: CC_TOOLKIT_MIN_TOKENS 高于实际输出时静默", () => {
   const file = writeTranscript([{ id: "m", ms: 2000, tokens: 100 }]);
-  const out = run("tps-hook.js", [], {
+  const out = run("cc-hook.js", [], {
     input: JSON.stringify({ transcript_path: file }),
-    env: { TPS_WATCH_MIN_TOKENS: "100000" },
+    env: { CC_TOOLKIT_MIN_TOKENS: "100000" },
   });
   assert.equal(out, "");
 });
 
-test("hook: TPS_WATCH_QUIET=1 在速度正常时静默，偏慢时告警", () => {
+test("hook: CC_TOOLKIT_QUIET=1 在速度正常时静默，偏慢时告警", () => {
   const fast = writeTranscript([{ id: "m", ms: 1000, tokens: 500 }]); // 500 tok/s
   assert.equal(
-    run("tps-hook.js", [], { input: JSON.stringify({ transcript_path: fast }), env: { TPS_WATCH_QUIET: "1" } }),
+    run("cc-hook.js", [], { input: JSON.stringify({ transcript_path: fast }), env: { CC_TOOLKIT_QUIET: "1" } }),
     ""
   );
 
   const slow = writeTranscript([{ id: "m", ms: 5000, tokens: 100 }]); // 20 tok/s
-  const out = run("tps-hook.js", [], {
+  const out = run("cc-hook.js", [], {
     input: JSON.stringify({ transcript_path: slow }),
-    env: { TPS_WATCH_QUIET: "1", TPS_WATCH_SLOW_TOKENS_PER_SEC: "40" },
+    env: { CC_TOOLKIT_QUIET: "1", CC_TOOLKIT_SLOW_TOKENS_PER_SEC: "40" },
   });
   assert.match(JSON.parse(out).systemMessage, /🐢 本轮偏慢/);
 });
 
 test("hook: stdin 不是合法 JSON 也不崩，退出码 0", () => {
-  const out = run("tps-hook.js", [], { input: "not json at all" });
+  const out = run("cc-hook.js", [], { input: "not json at all" });
   assert.equal(out === "" || JSON.parse(out).systemMessage !== undefined, true);
 });
 
 test("hook: transcript 指向不存在的文件时不崩", () => {
-  const out = run("tps-hook.js", [], {
+  const out = run("cc-hook.js", [], {
     input: JSON.stringify({ transcript_path: path.join(tmpRoot, "missing.jsonl"), cwd: tmpRoot }),
   });
   assert.equal(typeof out, "string"); // 退出码 0 由 execFileSync 保证
@@ -431,18 +431,18 @@ test("statusline: 有 transcript 时输出单行读数", () => {
     Array.from({ length: 4 }, (_, i) => ({ id: `m${i}`, ms: 1500, tokens: 600 })),
     { name: "statusline-session.jsonl" }
   );
-  const out = run("tps-statusline.js", [], {
+  const out = run("cc-statusline.js", [], {
     input: JSON.stringify({ session_id: "sess-status", transcript_path: file }),
   });
   assert.match(out, /⚡ \d+ tok\/s \(中位 \d+\)/);
 });
 
 test("statusline: 空 stdin 与禁用开关都安全退出", () => {
-  assert.equal(run("tps-statusline.js", [], { input: "" }), "");
+  assert.equal(run("cc-statusline.js", [], { input: "" }), "");
   assert.equal(
-    run("tps-statusline.js", [], {
+    run("cc-statusline.js", [], {
       input: JSON.stringify({ transcript_path: "x.jsonl" }),
-      env: { TPS_WATCH_DISABLE: "1" },
+      env: { CC_TOOLKIT_DISABLE: "1" },
     }),
     ""
   );
@@ -450,9 +450,9 @@ test("statusline: 空 stdin 与禁用开关都安全退出", () => {
 
 test("statusline: 自定义前缀生效", () => {
   const file = writeTranscript([{ id: "m", ms: 1500, tokens: 600 }], { name: "sl2.jsonl" });
-  const out = run("tps-statusline.js", [], {
+  const out = run("cc-statusline.js", [], {
     input: JSON.stringify({ session_id: "sess-prefix", transcript_path: file }),
-    env: { TPS_WATCH_STATUSLINE_PREFIX: "[tps] " },
+    env: { CC_TOOLKIT_STATUSLINE_PREFIX: "[tps] " },
   });
   assert.match(out, /^\[tps\] /);
 });
@@ -460,8 +460,8 @@ test("statusline: 自定义前缀生效", () => {
 // ── doctor ──────────────────────────────────────────────────────────────
 
 test("doctor: 正常退出并打印检查项", () => {
-  const out = run("tps-doctor.js", []);
-  assert.match(out, /tps-watch 环境自检/);
+  const out = run("cc-doctor.js", []);
+  assert.match(out, /cc-toolkit 环境自检/);
   assert.match(out, /Node\.js/);
   assert.match(out, /Stop hook/);
 });

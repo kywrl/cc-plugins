@@ -1,9 +1,9 @@
-# tps-watch
+# cc-toolkit
 
 实时监控 Claude Code 的**输出速度 (tok/s)**。
 
 - 每轮回复结束后显示本轮速度与近期中位数（Stop hook，自动生效）
-- `/tps-watch:tps` 查看历史分布、趋势与离群样本
+- `/cc-toolkit:tps` 查看历史分布、趋势与离群样本
 - 可选把读数放进状态栏
 - 零 npm 依赖、纯本地计算、不联网
 
@@ -16,7 +16,7 @@
 安装后让 Claude 回一句有实质内容的话即可。环境有问题就跑：
 
 ```
-/tps-watch:tps-doctor
+/cc-toolkit:tps-doctor
 ```
 
 ## 配置
@@ -25,8 +25,8 @@
 | --- | --- |
 | 开箱即用的每轮读数 | 安装后自动生效，无需配置 |
 | 打开状态栏读数 | 见仓库根 README 的「状态栏集成」 |
-| 安静模式（只在偏慢时提示） | `settings.json` → `env.TPS_WATCH_QUIET = "1"` |
-| 临时关掉 | `settings.json` → `env.TPS_WATCH_DISABLE = "1"` |
+| 安静模式（只在偏慢时提示） | `settings.json` → `env.CC_TOOLKIT_QUIET = "1"` |
+| 临时关掉 | `settings.json` → `env.CC_TOOLKIT_DISABLE = "1"` |
 
 **完整的安装方法、hooks 配置方法（含手工挂进 `settings.json` 的写法）、精度说明与故障排查，见
 [仓库根 README](../../README.md)。**

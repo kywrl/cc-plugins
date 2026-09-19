@@ -12,15 +12,15 @@
 
 - **Stop hook**：每轮回复结束后把本轮输出速度作为 `systemMessage` 展示给用户
   （只给用户看，不进模型上下文、不花 token）。usage 未落盘时会轮询几次尽量取到精确值。
-- **`/tps-watch:tps`**：多行快照 —— 当前一轮 + 最近 N 条 + 中位/p90/最快/最慢，
+- **`/cc-toolkit:tps`**：多行快照 —— 当前一轮 + 最近 N 条 + 中位/p90/最快/最慢，
   另附趋势（近 10 条 vs 更早 10 条）、离群慢样本与估算值占比。
-- **`/tps-watch:tps-live`**：生成实时监视命令。
-- **`/tps-watch:tps-doctor`**：环境自检（Node 版本、会话目录、会话定位、输出通道、环境变量）。
+- **`/cc-toolkit:tps-live`**：生成实时监视命令。
+- **`/cc-toolkit:tps-doctor`**：环境自检（Node 版本、会话目录、会话定位、输出通道、环境变量）。
 - **CLI**：`--once` / `--report` / `--json` / `--all` / `--history=N` / `--interval=MS` / `-p <项目>`。
-- **状态栏集成**（可选）：`tps-statusline.js`，优先读 hook 写的缓存，输出 `⚡ 89 tok/s (中位 151)`。
-- **环境变量开关**：`TPS_WATCH_DISABLE` / `TPS_WATCH_MIN_TOKENS` / `TPS_WATCH_QUIET` /
-  `TPS_WATCH_SLOW_TOKENS_PER_SEC` / `TPS_WATCH_VERBOSE` / `TPS_WATCH_STATUSLINE_PREFIX` /
-  `TPS_WATCH_STATUSLINE_CACHE_MS`。
+- **状态栏集成**（可选）：`cc-statusline.js`，优先读 hook 写的缓存，输出 `⚡ 89 tok/s (中位 151)`。
+- **环境变量开关**：`CC_TOOLKIT_DISABLE` / `CC_TOOLKIT_MIN_TOKENS` / `CC_TOOLKIT_QUIET` /
+  `CC_TOOLKIT_SLOW_TOKENS_PER_SEC` / `CC_TOOLKIT_VERBOSE` / `CC_TOOLKIT_STATUSLINE_PREFIX` /
+  `CC_TOOLKIT_STATUSLINE_CACHE_MS`。
 - **29 个测试**，基于 Node 内置测试运行器，零依赖。
 
 ### 设计要点

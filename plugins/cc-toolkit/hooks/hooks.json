@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/tps-hook.js\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/cc-hook.js\"",
             "timeout": 15
           }
         ]

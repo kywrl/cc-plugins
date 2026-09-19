@@ -7,7 +7,7 @@ disable-model-invocation: true
 
 下面是本地脚本读取会话日志算出的输出速度统计：
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/tps-watch.js" --report --history=$ARGUMENTS`
+!`node "${CLAUDE_PLUGIN_ROOT}/scripts/cc-watch.js" --report --history=$ARGUMENTS`
 
 把上面脚本的输出原样转述给用户即可，不要重新运行命令。
 

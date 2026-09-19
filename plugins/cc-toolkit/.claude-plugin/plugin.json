@@ -1,12 +1,12 @@
 {
-  "name": "tps-watch",
+  "name": "cc-toolkit",
   "version": "1.0.0",
   "description": "实时监控 Claude Code 的输出速度 (tok/s)。装好即在每轮回复后显示本轮速度，另带斜杠命令查看历史分布与趋势、可选状态栏集成。",
   "author": {
     "name": "kywrl",
     "url": "https://github.com/kywrl"
   },
-  "homepage": "https://github.com/kywrl/cc-toolkit/tree/main/plugins/tps-watch",
+  "homepage": "https://github.com/kywrl/cc-toolkit/tree/main/plugins/cc-toolkit",
   "repository": "https://github.com/kywrl/cc-toolkit",
   "license": "MIT",
   "keywords": [

@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 "use strict";
 /**
- * tps-doctor — 环境自检
+ * cc-doctor — 环境自检
  *
  * 装完插件后跑一下，确认：Node 版本够不够、会话目录在不在、
  * 当前工作目录能不能定位到会话文件、hook / statusline 该往哪配。
  *
- * 用法: node scripts/tps-doctor.js
+ * 用法: node scripts/cc-doctor.js
  */
 
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const core = require("./tps-core");
+const core = require("./cc-core");
 
 const OK = "✅";
 const WARN = "⚠️ ";
@@ -21,7 +21,7 @@ const BAD = "❌";
 const lines = [];
 const say = (s = "") => lines.push(s);
 
-say("tps-watch 环境自检");
+say("cc-toolkit 环境自检");
 say("──────────────────");
 
 // ① Node 版本：用到了 fs.readFileSync(0) / Object spread，10 以上稳妥
@@ -83,21 +83,21 @@ if (!picked) {
 say("");
 say("输出通道");
 say("────────");
-say(`${OK} Stop hook  : node "${path.join(__dirname, "tps-hook.js")}"`);
+say(`${OK} Stop hook  : node "${path.join(__dirname, "cc-hook.js")}"`);
 say("   → 由插件的 hooks/hooks.json 自动挂载，无需手工配置。");
 say("     · 每轮回复后显示本轮 tok/s 与近期中位数");
 say("     · 手工挂载方式：见 README 的「hooks 配置方法」一节");
 say("");
-say(`${OK} 状态栏(可选): node "${path.join(__dirname, "tps-statusline.js")}"`);
+say(`${OK} 状态栏(可选): node "${path.join(__dirname, "cc-statusline.js")}"`);
 say("   → 需手工写进 settings.json 的 statusLine；粘贴即用的片段见 README。");
 say("");
 say("环境变量开关");
 say("────────────");
-say("  TPS_WATCH_DISABLE=1             临时关闭（hook 与状态栏都受控）");
-say("  TPS_WATCH_MIN_TOKENS=30         低于该 token 数的响应不报告");
-say("  TPS_WATCH_QUIET=1               只在明显偏慢时才提示");
-say("  TPS_WATCH_SLOW_TOKENS_PER_SEC=20  QUIET 模式的「慢」阈值");
-say("  TPS_WATCH_VERBOSE=1             把诊断信息写到 stderr");
+say("  CC_TOOLKIT_DISABLE=1             临时关闭（hook 与状态栏都受控）");
+say("  CC_TOOLKIT_MIN_TOKENS=30         低于该 token 数的响应不报告");
+say("  CC_TOOLKIT_QUIET=1               只在明显偏慢时才提示");
+say("  CC_TOOLKIT_SLOW_TOKENS_PER_SEC=20  QUIET 模式的「慢」阈值");
+say("  CC_TOOLKIT_VERBOSE=1             把诊断信息写到 stderr");
 
 say("");
 say(`缓存目录: ${os.tmpdir()}`);

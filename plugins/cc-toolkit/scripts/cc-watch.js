@@ -1,22 +1,22 @@
 #!/usr/bin/env node
 "use strict";
 /**
- * tps-watch — 实时查看 Claude Code 会话的输出速度 (tok/s)
+ * cc-watch — 实时查看 Claude Code 会话的输出速度 (tok/s)
  *
  * 用法:
- *   node scripts/tps-watch.js                # 实时监视（自动定位当前项目的会话）
- *   node scripts/tps-watch.js --report       # 打印多行快照后退出（给斜杠命令用）
- *   node scripts/tps-watch.js --once         # 只打印一行汇总后退出
- *   node scripts/tps-watch.js --json         # 输出结构化 JSON（给脚本 / 模型消费）
- *   node scripts/tps-watch.js <file.jsonl>   # 跟踪指定会话文件
- *   node scripts/tps-watch.js -p <项目名>     # 指定项目目录名，如 D--workspace-cc-toolkit
- *   node scripts/tps-watch.js --history=20   # 快照里显示最近多少条（默认 10）
- *   node scripts/tps-watch.js --interval=500 # 实时模式的刷新间隔（毫秒，默认 800）
- *   node scripts/tps-watch.js --all          # 回放整个会话文件（默认只回放末尾 2MB）
+ *   node scripts/cc-watch.js                # 实时监视（自动定位当前项目的会话）
+ *   node scripts/cc-watch.js --report       # 打印多行快照后退出（给斜杠命令用）
+ *   node scripts/cc-watch.js --once         # 只打印一行汇总后退出
+ *   node scripts/cc-watch.js --json         # 输出结构化 JSON（给脚本 / 模型消费）
+ *   node scripts/cc-watch.js <file.jsonl>   # 跟踪指定会话文件
+ *   node scripts/cc-watch.js -p <项目名>     # 指定项目目录名，如 D--workspace-cc-toolkit
+ *   node scripts/cc-watch.js --history=20   # 快照里显示最近多少条（默认 10）
+ *   node scripts/cc-watch.js --interval=500 # 实时模式的刷新间隔（毫秒，默认 800）
+ *   node scripts/cc-watch.js --all          # 回放整个会话文件（默认只回放末尾 2MB）
  */
 
 const path = require("path");
-const core = require("./tps-core");
+const core = require("./cc-core");
 
 function parseArgs(argv) {
   const flag = (name) => argv.includes(`--${name}`);
@@ -123,7 +123,7 @@ function main() {
   const file = core.pickSessionFile({ explicit: opts.explicit, project: opts.project });
   if (!file) {
     console.error(
-      "未找到会话文件。用 node scripts/tps-watch.js <file.jsonl> 指定，或用 -p <项目名> 过滤。"
+      "未找到会话文件。用 node scripts/cc-watch.js <file.jsonl> 指定，或用 -p <项目名> 过滤。"
     );
     process.exit(1);
   }

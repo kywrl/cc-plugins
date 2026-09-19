@@ -1,11 +1,11 @@
 "use strict";
 /**
- * tps-core.js — Claude Code 会话输出速度 (tok/s) 计算引擎
+ * cc-core.js — Claude Code 会话输出速度 (tok/s) 计算引擎
  *
- * 这是 tps-watch 插件的核心。它被三个入口复用：
- *   scripts/tps-watch.js      (CLI: 实时 / --once / --report / --json)
- *   scripts/tps-hook.js       (Stop hook: 把速度作为 systemMessage 回吐给用户)
- *   scripts/tps-statusline.js (statusline: 单行摘要)
+ * 这是 cc-toolkit 插件的核心。它被三个入口复用：
+ *   scripts/cc-toolkit.js      (CLI: 实时 / --once / --report / --json)
+ *   scripts/cc-hook.js       (Stop hook: 把速度作为 systemMessage 回吐给用户)
+ *   scripts/cc-statusline.js (statusline: 单行摘要)
  *
  * ── 数据来源 ────────────────────────────────────────────────────────────
  *   ~/.claude/projects/<项目目录名>/<session-id>.jsonl
@@ -218,7 +218,7 @@ class SessionTracker {
   /**
    * 收尾：把「已经结束、但还没有下一轮来触发归档」的当前轮次也纳入统计视图。
    *
-   * 最后一轮永远等不到下一个 message.id。如果不收尾，/tps 的统计和状态栏
+   * 最后一轮永远等不到下一个 message.id。如果不收尾，/cc-toolkit:tps 的统计和状态栏
    * 就永远漏掉最新的一轮（会话越短这个偏差越显眼）。
    *
    * 默认不修改 tracker 状态：只在返回的样本列表里追加当前轮，
@@ -421,7 +421,7 @@ class SessionTracker {
 // ── 跨进程缓存（给 statusline 用）──────────────────────────────────────
 
 function cacheFileFor(sessionId) {
-  return path.join(os.tmpdir(), `tps-watch-${sessionId || "default"}.json`);
+  return path.join(os.tmpdir(), `cc-toolkit-${sessionId || "default"}.json`);
 }
 
 /** 读缓存；过期（超过 maxAgeMs）或损坏都返回 null */
@@ -460,7 +460,7 @@ function trackerForHookEvent(event, opts = {}) {
   return new SessionTracker(file).start(opts);
 }
 
-// ── 分析：从样本里提炼洞察（给 /tps 命令的 AI 解读用）──────────────────
+// ── 分析：从样本里提炼洞察（给 /cc-toolkit:tps 命令的 AI 解读用）──────────────────
 
 /**
  * 对样本做趋势 / 分布分析，输出结构化事实。
