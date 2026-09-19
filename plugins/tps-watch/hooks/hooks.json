@@ -1,0 +1,16 @@
+{
+  "description": "Stop hook — 每轮回复结束后把输出速度 (tok/s) 作为 systemMessage 展示给用户，同时把样本写入缓存供 statusline 使用",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/tps-hook.js\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

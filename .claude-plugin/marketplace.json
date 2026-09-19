@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "cc-toolkit",
+  "description": "Claude Code 实用插件集合 —— 度量、可观测性与工作流增强工具。",
+  "owner": {
+    "name": "kywrl",
+    "url": "https://github.com/kywrl"
+  },
+  "plugins": [
+    {
+      "name": "tps-watch",
+      "source": "./plugins/tps-watch",
+      "description": "实时监控 Claude Code 的输出速度 (tok/s)。每轮回复结束后显示本轮速度与近期中位数，提供 /tps 查看历史分布与趋势，可选把读数放进状态栏。零 npm 依赖，全部数据在本地计算。",
+      "category": "monitoring",
+      "homepage": "https://github.com/kywrl/cc-toolkit/tree/main/plugins/tps-watch"
+    }
+  ]
+}

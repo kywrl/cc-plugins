@@ -1,0 +1,507 @@
+# tps-watch
+
+实时监控 **Claude Code 的输出速度（tok/s）**。
+
+装好即在每轮回复后看到本轮速度；`/tps-watch:tps` 查看历史分布、趋势与离群样本；可选把读数放进状态栏。
+零 npm 依赖、纯本地计算、不联网、不上报。
+
+```
+⚡ 本轮 89 tok/s  (349 tok / 3.9s)  ·  近8条中位 151 tok/s
+```
+
+```text
+$ /tps-watch:tps
+会话 25ac6b0e  项目 D--workspace-cc-toolkit
+当前（流式进行中）: ≈44 tok/s  141 tok / 3.2s
+最近 5 条已完成的响应:
+  01:44:42     696 tok /   4.6s =  151 tok/s
+  01:44:46     332 tok /   3.4s =   99 tok/s
+  01:44:54    1657 tok /   7.8s =  212 tok/s
+  01:45:01    1331 tok /   7.2s =  184 tok/s
+  01:45:05     349 tok /   3.9s =   89 tok/s
+中位 151 tok/s | p90 212 | 最快 212 (01:44:54) | 最慢 89 (01:45:05)
+```
+
+---
+
+## 目录
+
+- [为什么需要它](#为什么需要它)
+- [安装方法](#安装方法)
+- [hooks 配置方法](#hooks-配置方法)
+- [斜杠命令](#斜杠命令)
+- [状态栏集成（可选）](#状态栏集成可选)
+- [环境变量开关](#环境变量开关)
+- [数据来源与精度](#数据来源与精度)
+- [故障排查](#故障排查)
+- [仓库结构](#仓库结构)
+- [开发与测试](#开发与测试)
+- [License](#license)
+
+---
+
+## 为什么需要它
+
+调模型、换供应商、比较不同 effort 档位的时候，"感觉变快了" 和 "真的变快了" 是两回事。
+tps-watch 从 Claude Code 自己写的会话日志里算出每一轮的真实输出速度，给你一个可比的数字。
+
+几个典型用法：
+
+- 换了一个 API 供应商 / 网关，想知道吞吐到底差多少；
+- 调 `effortLevel` 或换模型，想看速度与质量的实际取舍；
+- 会话突然变卡，想确认是模型慢、还是工具调用多、还是自己在读大文件；
+- 就想在状态栏里一直看到那个数字。
+
+---
+
+## 安装方法
+
+### 方式一：从 GitHub 安装（推荐）
+
+在本仓库发布后，于 Claude Code 里执行两条命令：
+
+```bash
+/plugin marketplace add kywrl/cc-toolkit
+```
+
+```bash
+/plugin install tps-watch@cc-toolkit
+```
+
+第一条把本仓库注册为一个插件市场（`cc-toolkit` 是 [marketplace.json](.claude-plugin/marketplace.json) 里声明的市场名），
+第二条安装插件。装完 Stop hook 自动生效，**不需要手工改 `settings.json`**。
+
+安装后会写入 `~/.claude/settings.json`（用户级作用域）：
+
+```json
+{
+  "enabledPlugins": {
+    "tps-watch@cc-toolkit": true
+  }
+}
+```
+
+> 想装到某个项目而不是全局？安装时选择 project 作用域即可，配置会落到 `<项目>/.claude/settings.json`。
+
+### 方式二：从本地目录加载（开发 / 试用）
+
+不用发布也能装。
+
+**直接在会话里注册本地市场并安装**（在仓库根目录启动 Claude Code，然后）：
+
+```bash
+/plugin marketplace add ./
+```
+
+```bash
+/plugin install tps-watch@cc-toolkit
+```
+
+等价 CLI：
+
+```bash
+claude plugin marketplace add ./
+claude plugin install tps-watch@cc-toolkit --scope user
+```
+
+**或者只加载插件目录、不进市场**（改代码即时生效，适合边改边试）：
+
+```bash
+claude --plugin-dir /path/to/cc-toolkit/plugins/tps-watch
+```
+
+> `--plugin-dir` 要指向**插件目录**（含 `.claude-plugin/plugin.json` 的那一层），
+> 不是仓库根目录 —— 仓库根是市场根，只含 `marketplace.json`。
+
+### 方式三：不用插件系统，只要脚本
+
+脚本本身是独立的，`node` 直接跑就行，不依赖插件运行时：
+
+```bash
+node /path/to/cc-toolkit/plugins/tps-watch/scripts/tps-watch.js --once
+```
+
+但这样斜杠命令和自动 hook 都不会有，需要自己按下一节手工配置 hook。
+
+### 前置条件
+
+- **Node.js ≥ 16**（用到 `fs.readFileSync(0)`；建议 18+）。检查：`node --version`
+- 没有任何 npm 依赖，不需要 `npm install`
+- 首次使用前至少跑过一次 Claude Code 会话（会话日志是数据源）
+
+装完先跑个自检确认环境没问题：
+
+```bash
+/tps-watch:tps-doctor
+```
+
+---
+
+## hooks 配置方法
+
+这是本插件的核心。分三种情况，按需选一种。
+
+### A. 用插件安装 —— 已经自动配好了
+
+插件的 [hooks/hooks.json](plugins/tps-watch/hooks/hooks.json) 会被 Claude Code 自动加载，内容就是：
+
+```json
+{
+  "description": "Stop hook — 每轮回复结束后把输出速度 (tok/s) 作为 systemMessage 展示给用户",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/tps-hook.js\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+几点说明：
+
+| 项 | 说明 |
+| --- | --- |
+| 事件 | `Stop` —— 每轮助手回复结束时触发一次 |
+| `matcher` | **不写**。Stop 事件不支持 matcher，写了也没用 |
+| `${CLAUDE_PLUGIN_ROOT}` | 由 Claude Code 在插件 hook 里自动替换成插件安装目录，所以不需要写绝对路径 |
+| `timeout` | 15 秒。脚本实际最多等约 0.5 秒（轮询取精确 usage），15 秒是安全余量 |
+| 输出 | `{"systemMessage": "..."}` —— **只展示给用户，不进模型上下文**，不花 token、不污染对话 |
+
+> **为什么用 `systemMessage` 而不是别的？**
+> Stop hook 的 `decision: "block"` + `reason` 是"阻止 Claude 停下"的控制信号，会把内容喂给模型；
+> `hookSpecificOutput.additionalContext` 同样是给模型的。只有 `systemMessage` 是纯净的用户侧提示。
+
+### B. 不用插件，手工挂进 settings.json
+
+如果你只想用脚本、不想装插件，把 hook 手写进配置文件即可。
+
+**用户级**（对所有项目生效）：`~/.claude/settings.json`
+**项目级**（只对本项目生效，可提交进 git 与团队共享）：`<项目>/.claude/settings.json`
+
+把下面这段合并进去（注意 `hooks` 是与 `permissions`、`env` 平级的顶层字段）：
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/absolute/path/to/cc-toolkit/plugins/tps-watch/scripts/tps-hook.js\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+⚠️ **手工配置时必须写绝对路径**：`${CLAUDE_PLUGIN_ROOT}` 只在插件提供的 hook 里会被替换，写在 `settings.json` 里不会被解析。
+
+Windows 路径记得转义反斜杠，例如：
+
+```json
+"command": "node \"C:/Users/me/cc-toolkit/plugins/tps-watch/scripts/tps-hook.js\""
+```
+
+（正斜杠在 Windows 上同样可用，且不用转义，推荐。）
+
+**已经在用 `~/.claude/tps-watch.js --hook`？** 那是本插件的原始独立脚本。如果两个 hook 同时存在，每轮会打印两条读数。
+保留插件版的话，把原来那条删掉再执行 `/hooks` 或重启 Claude Code 让配置生效。
+
+### C. 只挂在特定项目上
+
+同上，但写进 `<项目>/.claude/settings.json`。适合团队统一口径——
+团队每个人都看到同样的计量方式，讨论速度差异时不容易各说各话。
+
+### 挂上之后怎么验证
+
+1. 让 Claude 回一句有实质内容的话（输出太短会被 `TPS_WATCH_MIN_TOKENS` 过滤，默认 30 tok）；
+2. 回复结束后应看到 `⚡ 本轮 … tok/s`；
+3. 没看到就调试：
+
+```bash
+echo '{"session_id":"t","transcript_path":"/path/to/session.jsonl","hook_event_name":"Stop"}' | TPS_WATCH_VERBOSE=1 node /path/to/plugins/tps-watch/scripts/tps-hook.js
+```
+
+`TPS_WATCH_VERBOSE=1` 会把"为什么静默退出"打到 stderr，例如 `样本太小 (12 < 30 tok)`。
+
+---
+
+## 斜杠命令
+
+命令从插件安装时带 `/tps-watch:` 前缀：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/tps-watch:tps [条数]` | 多行快照：当前一轮 + 最近 N 条 + 中位/p90/最快/最慢 + 趋势与离群样本。参数默认 10，可加 `--all` 回放整个会话文件 |
+| `/tps-watch:tps-live [参数]` | 生成实时监视命令（前台长驻，Ctrl-C 退出）。可选 `--interval=500`、`-p 项目目录名` |
+| `/tps-watch:tps-doctor` | 环境自检：Node 版本、会话目录、能否定位当前会话、hook / 状态栏该往哪配 |
+
+命令行等价形式（不装插件也能用）：
+
+```bash
+node plugins/tps-watch/scripts/tps-watch.js --report --history=20
+```
+
+```bash
+node plugins/tps-watch/scripts/tps-watch.js
+```
+
+```bash
+node plugins/tps-watch/scripts/tps-watch.js --json --history=5
+```
+
+完整参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| （无参数） | 实时监视，默认 800ms 刷新 |
+| `--report` | 打印多行快照 + 统计事实后退出 |
+| `--once` | 只打印一行汇总后退出 |
+| `--json` | 输出结构化 JSON，便于接别的脚本 |
+| `--history=N` | 快照里显示最近 N 条（默认 10） |
+| `--interval=MS` | 实时模式刷新间隔，最小 200（默认 800） |
+| `--all` | 回放整个会话文件（默认只回放末尾 2MB） |
+| `-p <名字>` | 按项目目录名子串过滤，如 `-p D--workspace-cc-toolkit` |
+| `<file.jsonl>` | 直接指定会话文件 |
+
+---
+
+## 状态栏集成（可选）
+
+状态栏每次刷新都会调用脚本，所以插件把**最近一次 Stop hook 的结果缓存到临时目录**，状态栏优先读缓存，
+读不到才回放会话末尾 400KB。不会因为状态栏而反复扫大文件。
+
+在 `~/.claude/settings.json` 里加（`statusLine` 与 `hooks` 平级）：
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/tps-statusline.js\"",
+    "padding": 0
+  }
+}
+```
+
+注意：`${CLAUDE_PLUGIN_ROOT}` 同样只在插件 hook 里替换 —— 但 `statusLine` 属于 `settings.json`，
+所以这里**要写绝对路径**：
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node \"C:/Users/me/cc-toolkit/plugins/tps-watch/scripts/tps-statusline.js\""
+  }
+}
+```
+
+输出形如 `⚡ 89 tok/s (中位 151)`。
+
+如果你已经有自己的状态栏脚本了，不想换掉整个 statusLine，可以让它内部调一下本脚本：
+
+```bash
+TPS=$(node "/path/to/tps-statusline.js" </dev/null)
+```
+
+---
+
+## 环境变量开关
+
+hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `env` 里设置即可对 hook 生效：
+
+```json
+{
+  "env": {
+    "TPS_WATCH_MIN_TOKENS": "50"
+  }
+}
+```
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `TPS_WATCH_DISABLE` | — | 设为 `1` 完全禁用（hook 与状态栏都静默退出） |
+| `TPS_WATCH_MIN_TOKENS` | `30` | 低于该 token 数不报告，避免"嗯"一声也弹个数 |
+| `TPS_WATCH_QUIET` | — | 设为 `1` 只在明显偏慢时才提示，平时安静 |
+| `TPS_WATCH_SLOW_TOKENS_PER_SEC` | `20` | QUIET 模式下的"慢"阈值 |
+| `TPS_WATCH_VERBOSE` | — | 设为 `1` 把诊断信息写到 stderr |
+| `TPS_WATCH_STATUSLINE_PREFIX` | `⚡ ` | 状态栏前缀 |
+| `TPS_WATCH_STATUSLINE_CACHE_MS` | `45000` | 状态栏缓存有效期（毫秒） |
+
+只想临时静音一轮，直接在 shell 里 `export TPS_WATCH_DISABLE=1` 再启动 Claude Code 即可。
+
+---
+
+## 数据来源与精度
+
+数据源是 Claude Code 自己写的会话日志：
+
+```
+~/.claude/projects/<项目目录名>/<session-id>.jsonl
+```
+
+`<项目目录名>` 是工作目录把非字母数字字符全部替换成 `-` 的结果，
+例如 `D:\workspace\cc-toolkit` → `D--workspace-cc-toolkit`。
+
+### 为什么有时候数字带 `≈`
+
+会话日志是**内容块级**落盘——一个 thinking / text / tool_use 块写一行，**不是逐 token 流式写入**。
+这不是插件能绕过的限制，是数据源的粒度。所以：
+
+| 场景 | 精度 | 标记 |
+| --- | --- | --- |
+| 响应已结束，`usage.output_tokens` 已落盘 | **精确**：真实 token ÷ 真实耗时 | 无标记 |
+| 响应正在流式，usage 还没写 | **估算**：块内容按字符数换算（CJK ≈ 1.5 字符/tok，其余 ≈ 4 字符/tok） | `≈` |
+
+所有输出都用 `≈` 明确区分两者，不会拿估算值冒充精确值。usage 落盘后估算值会被自动替换掉。
+
+### 其他口径
+
+- **耗时起点**：用"上一行日志的时间戳"，也就是用户发出消息的时刻，而不是第一个内容块落盘的时刻。
+  否则首块延迟（TTFT）会被漏掉，速度看起来偏快。
+- **子代理不计入**：`isSidechain` 的行会被跳过，统计的是主会话自己的输出。
+- **样本过滤**：少于 50 token 或短于 300ms 的响应不进统计（噪声太大）。
+- **实时刷新粒度**：流式过程中只有块落盘的那一刻数字才会动，所以实时模式看起来是"跳"的而不是连续滚动的。
+- **回放上限**：默认只回放会话文件末尾 2MB，避免超长会话拖慢启动。要全量用 `--all`。
+
+---
+
+## 故障排查
+
+**Q: 完全看不到任何输出**
+
+1. 跑 `/tps-watch:tps-doctor` 看环境；
+2. 确认 Node 能跑：`node --version`；
+3. 手动喂一个假事件看 hook 的原始输出：
+
+```bash
+echo '{"session_id":"t","transcript_path":"C:/Users/me/.claude/projects/项目目录名/会话id.jsonl","hook_event_name":"Stop"}' | node "C:/path/to/tps-hook.js"
+```
+
+4. 确认没被环境变量关掉：`TPS_WATCH_DISABLE` / `TPS_WATCH_QUIET`；
+
+**Q: 数字显示 `0 tok/s` 或一直 "… 等待响应"**
+
+说明当前没有正在流式的响应。跑 `/tps-watch:tps` 看历史样本，或用 `--all` 全量回放。
+
+**Q: 抓到了别的会话**
+
+多开会话时自动定位可能猜错。用 `-p D--workspace-cc-toolkit`（`<项目目录名>` 的一部分即可）或直接指定 `.jsonl` 文件。
+
+**Q: 每轮出现两条读数**
+
+`~/.claude/tps-watch.js --hook` 和插件的 hook 都在跑。留一个，删掉另一个，然后 `/hooks` 或重启生效。
+
+**Q: 数字忽高忽低**
+
+正常。token 数少的轮次方差天然大（几秒的窗口里多一个块就变化明显）。
+看 `/tps-watch:tps` 的中位数，别盯单条；`/tps-watch:tps` 会明确标出离群样本。
+
+**Q: 和第三方 API 网关一起用**
+
+照常工作。速度反映的是网关 + 模型的实际吞吐，混合了网络与排队延迟——这正是你想测的东西。
+
+---
+
+## 仓库结构
+
+```
+cc-toolkit/
+├── .claude-plugin/
+│   └── marketplace.json              # 市场清单：把本仓库注册成插件市场
+├── plugins/
+│   └── tps-watch/
+│       ├── .claude-plugin/
+│       │   └── plugin.json           # 插件清单
+│       ├── hooks/
+│       │   └── hooks.json            # Stop hook 声明（自动加载，无需手工配置）
+│       ├── commands/
+│       │   ├── tps.md                # /tps-watch:tps
+│       │   ├── tps-live.md           # /tps-watch:tps-live
+│       │   └── tps-doctor.md         # /tps-watch:tps-doctor
+│       ├── scripts/
+│       │   ├── tps-core.js           # 计算引擎：日志解析 / 轮次归档 / tok-s 统计 / 渲染
+│       │   ├── tps-watch.js          # CLI：实时 / --once / --report / --json
+│       │   ├── tps-hook.js           # Stop hook：回吐 systemMessage + 写状态栏缓存
+│       │   ├── tps-statusline.js     # 状态栏：读缓存，输出单行读数
+│       │   └── tps-doctor.js         # 环境自检
+│       ├── tests/
+│       │   └── tps-watch.test.js     # 29 个测试，Node 内置测试运行器，零依赖
+│       └── LICENSE
+├── LICENSE
+└── README.md
+```
+
+---
+
+## 开发与测试
+
+零依赖，`git clone` 后直接跑：
+
+```bash
+node --test "plugins/tps-watch/tests/*.test.js"
+```
+
+本地调试插件（不安装、改完即生效）：
+
+```bash
+claude --plugin-dir ./plugins/tps-watch
+```
+
+校验清单文件是否合法：
+
+```bash
+claude plugin validate ./plugins/tps-watch
+```
+
+```bash
+claude plugin validate .
+```
+
+装完可以看看插件被识别出了哪些组件：
+
+```bash
+claude plugin details tps-watch
+```
+
+（正常应显示 `Skills (3)` + `Hooks (1) Stop`，且 Stop hook 标注为 `harness-only — no model context cost`。）
+
+hook 的调试开关：
+
+```bash
+TPS_WATCH_VERBOSE=1 claude
+```
+
+诊断信息会打到 stderr，正常输出协议不受影响。
+
+### 扩展点
+
+`tps-core.js` 是纯函数库，没有副作用，可以直接 require 进别的脚本：
+
+```js
+const core = require("./scripts/tps-core");
+
+const file = core.pickSessionFile({ cwd: process.cwd() });
+const tracker = new core.SessionTracker(file).start();
+tracker.pump();
+
+console.log(tracker.stats());          // 中位 / p90 / 最快 / 最慢 / 累计
+console.log(tracker.currentSpeed());   // 当前一轮
+console.log(core.analyze(tracker));    // 趋势、离群样本、估算占比
+```
+
+---
+
+## License
+
+[MIT](LICENSE)
