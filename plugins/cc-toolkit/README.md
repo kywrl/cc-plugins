@@ -13,11 +13,36 @@
 
 ## 快速开始
 
-安装后让 Claude 回一句有实质内容的话即可。环境有问题就跑：
+安装后让 Claude 回一句有实质内容的话即可。
+
+**但如果你的 `ANTHROPIC_BASE_URL` 指向第三方网关/代理**，插件自带的 hook 不会生效
+（原因见下），需要补一条命令把它挂进 `settings.json`：
+
+```
+/cc-toolkit:install-hook
+```
+
+环境有问题就跑：
 
 ```
 /cc-toolkit:tps-doctor
 ```
+
+## ⚠️ 第三方 provider 需要额外一步
+
+Claude Code 用 `tengu_plugin_hooks_modules` 这个灰度开关控制「**已安装插件**的 hook
+是否生效」，默认值是 **off**。用第三方 `ANTHROPIC_BASE_URL` 时 GrowthBook 被关闭，
+拿不到下发值，开关就一直是 off → 插件自带的 `hooks/hooks.json` 不被执行。
+（内置插件有豁免，所以官方 provider 用户开箱即用。）
+
+应对就是上面那条 `/cc-toolkit:install-hook`——它把 hook 挂进 `settings.json`，
+生成的命令用通配符在运行时定位插件脚本，所以**插件升级换版本号也不会失效**：
+
+```
+node "$(ls -d ~/.claude/plugins/cache/*/cc-toolkit/*/scripts/cc-hook.js | head -1)"
+```
+
+注意这里**挂的是插件里的脚本，不是本地脚本**。
 
 ## 配置
 

@@ -23,6 +23,16 @@
   `CC_TOOLKIT_STATUSLINE_CACHE_MS`。
 - **29 个测试**，基于 Node 内置测试运行器，零依赖。
 
+### 已知限制与应对
+
+- **第三方 provider 下插件自带 hook 不生效。** 用 `ANTHROPIC_BASE_URL` 指向中转网关
+  或自建代理时，Claude Code 会关闭 GrowthBook 灰度服务，而
+  `tengu_plugin_hooks_modules`（控制「已安装插件的 hook 是否生效」的开关）默认值为
+  off，拿不到下发值 → 插件自带的 `hooks/hooks.json` 不会被注册执行
+  （内置插件有豁免，官方 provider 用户开箱即用）。
+  应对：用 `/cc-toolkit:install-hook` 或手工把 hook 挂进 `settings.json`。
+  **挂的仍然是插件里的脚本**，不是本地脚本。
+
 ### 设计要点
 
 - **精确值优先**：已结束的响应一律用 `usage.output_tokens ÷ 真实耗时`；

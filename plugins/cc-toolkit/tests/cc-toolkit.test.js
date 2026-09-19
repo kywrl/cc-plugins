@@ -307,6 +307,260 @@ test("缓存：写入后可按 sessionId 读回，过期则失效", () => {
   fs.rmSync(core.cacheFileFor(id), { force: true });
 });
 
+// ── cc-resolve：插件路径定位 ────────────────────────────────────────────
+
+/** 在临时目录里造一个「像插件的」目录树 */
+function fakePluginRoot(parent, name = "cc-toolkit") {
+  const root = path.join(parent, name);
+  fs.mkdirSync(path.join(root, ".claude-plugin"), { recursive: true });
+  fs.mkdirSync(path.join(root, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".claude-plugin", "plugin.json"), '{"name":"cc-toolkit"}');
+  fs.writeFileSync(path.join(root, "scripts", "cc-core.js"), "module.exports={};");
+  fs.writeFileSync(path.join(root, "scripts", "cc-hook.js"), "process.exit(0);");
+  fs.writeFileSync(path.join(root, "scripts", "cc-resolve.js"), fs.readFileSync(path.join(SCRIPTS, "cc-resolve.js")));
+  return root;
+}
+
+/** 造一个假的 Claude 配置目录 */
+function fakeConfigDir({ installPath, market, version } = {}) {
+  const cfg = fs.mkdtempSync(path.join(tmpRoot, "cfg-"));
+
+  if (installPath) {
+    fs.mkdirSync(path.join(cfg, "plugins"), { recursive: true });
+    fs.writeFileSync(
+      path.join(cfg, "plugins", "installed_plugins.json"),
+      JSON.stringify({ version: 2, plugins: { "cc-toolkit@cc-plugins": [{ installPath }] } })
+    );
+  }
+
+  // 造 plugins/cache/<market>/cc-toolkit/<version>/ 这一层
+  if (market && version) {
+    const pluginDir = path.join(cfg, "plugins", "cache", market, "cc-toolkit");
+    fakePluginRoot(pluginDir, version);
+  }
+
+  return cfg;
+}
+
+const runResolve = (args, cfgDir, extraEnv) =>
+  execFileSync(process.execPath, [path.join(SCRIPTS, "cc-resolve.js"), ...args], {
+    encoding: "utf8",
+    env: { ...process.env, CLAUDE_CONFIG_DIR: cfgDir, ...(extraEnv || {}) },
+    timeout: 20000,
+  });
+
+test("cc-resolve: 从 installed_plugins.json 的 installPath 定位（跟随版本）", () => {
+  const root = fakePluginRoot(fs.mkdtempSync(path.join(tmpRoot, "inst-")));
+  const cfg = fakeConfigDir({ installPath: root });
+
+  assert.equal(runResolve(["--print"], cfg).trim(), root);
+  assert.equal(runResolve(["--which", "cc-hook.js"], cfg).trim(), path.join(root, "scripts", "cc-hook.js"));
+});
+
+test("cc-resolve: CLAUDE_PLUGIN_ROOT 优先级高于注册表", () => {
+  const registered = fakePluginRoot(fs.mkdtempSync(path.join(tmpRoot, "reg-")), "cc-toolkit");
+  const override = fakePluginRoot(fs.mkdtempSync(path.join(tmpRoot, "ovr-")), "cc-toolkit");
+  const cfg = fakeConfigDir({ installPath: registered });
+
+  const out = runResolve(["--print"], cfg, { CLAUDE_PLUGIN_ROOT: override });
+  assert.equal(out.trim(), override);
+});
+
+test("cc-resolve: CC_TOOLKIT_PLUGIN_ROOT 优先级最高", () => {
+  const explicit = fakePluginRoot(fs.mkdtempSync(path.join(tmpRoot, "exp-")), "cc-toolkit");
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+
+  const out = runResolve(["--print"], cfg, { CC_TOOLKIT_PLUGIN_ROOT: explicit });
+  assert.equal(out.trim(), explicit);
+});
+
+test("cc-resolve: 注册表缺失时回退到目录扫描", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  const out = runResolve(["--print"], cfg).replace(/\\/g, "/");
+  assert.match(out, /plugins\/cache\/cc-plugins\/cc-toolkit\/1\.0\.0\s*$/);
+});
+
+test("cc-resolve: 扫描时多个版本取字典序最大的", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  for (const v of ["1.10.0", "2.0.0"]) {
+    const dir = path.join(cfg, "plugins", "cache", "cc-plugins", "cc-toolkit", v);
+    fs.mkdirSync(path.join(dir, ".claude-plugin"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude-plugin", "plugin.json"), '{"name":"cc-toolkit"}');
+    fs.writeFileSync(path.join(dir, "scripts", "cc-core.js"), "module.exports={};");
+  }
+  const out = runResolve(["--print"], cfg).replace(/\\/g, "/").trim();
+  assert.match(out, /2\.0\.0$/, "应选中最新版本");
+});
+
+test("cc-resolve: 找不到插件时非 0 退出并给出可操作指引", () => {
+  const cfg = fs.mkdtempSync(path.join(tmpRoot, "empty-"));
+  assert.throws(
+    () => runResolve(["--print"], cfg),
+    (err) => {
+      const msg = String(err.stderr || "");
+      assert.match(msg, /找不到 cc-toolkit 插件的安装目录/);
+      assert.match(msg, /CC_TOOLKIT_PLUGIN_ROOT/, "应提示可用的补救手段");
+      assert.match(msg, /plugin install/, "应提示安装命令");
+      return err.status === 1;
+    }
+  );
+});
+
+test("cc-resolve: --which 缺参数时报错退出", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  assert.throws(
+    () => runResolve(["--which"], cfg),
+    (err) => err.status === 2
+  );
+});
+
+test("cc-resolve: 转发时保持 stdout 协议与退出码", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  const root = path.join(cfg, "plugins", "cache", "cc-plugins", "cc-toolkit", "1.0.0");
+
+  // 让被转发的脚本回一个 hook 协议 JSON，验证 stdin/stdout 直连没被破坏
+  fs.writeFileSync(
+    path.join(root, "scripts", "cc-hook.js"),
+    'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{process.stdout.write(JSON.stringify({systemMessage:"ok:"+s.trim()}));});'
+  );
+
+  const out = execFileSync(process.execPath, [path.join(SCRIPTS, "cc-resolve.js"), "cc-hook.js"], {
+    input: "hello",
+    encoding: "utf8",
+    env: { ...process.env, CLAUDE_CONFIG_DIR: cfg },
+    timeout: 20000,
+  });
+  assert.deepEqual(JSON.parse(out), { systemMessage: "ok:hello" });
+});
+
+test("cc-resolve: 转发时透传子进程退出码", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  const root = path.join(cfg, "plugins", "cache", "cc-plugins", "cc-toolkit", "1.0.0");
+  fs.writeFileSync(path.join(root, "scripts", "cc-hook.js"), "process.exit(3);");
+
+  assert.throws(
+    () => execFileSync(process.execPath, [path.join(SCRIPTS, "cc-resolve.js"), "cc-hook.js"], {
+      encoding: "utf8",
+      env: { ...process.env, CLAUDE_CONFIG_DIR: cfg },
+      timeout: 20000,
+    }),
+    (err) => err.status === 3
+  );
+});
+
+test("cc-resolve: 目标脚本不存在时报错非 0", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  assert.throws(
+    () => runResolve(["cc-nonexistent.js"], cfg),
+    (err) => err.status === 1
+  );
+});
+
+// ── cc-install-hook：写入 settings.json ─────────────────────────────────
+
+const runInstall = (args, cfgDir, env) =>
+  execFileSync(process.execPath, [path.join(SCRIPTS, "cc-install-hook.js"), ...args], {
+    encoding: "utf8",
+    env: { ...process.env, CLAUDE_CONFIG_DIR: cfgDir, ...(env || {}) },
+    timeout: 20000,
+  });
+
+test("cc-install-hook: 写入跨版本的 glob 命令，而不是写死绝对路径", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  runInstall([], cfg);
+
+  const settings = JSON.parse(fs.readFileSync(path.join(cfg, "settings.json"), "utf8"));
+  const cmd = settings.hooks.Stop[0].hooks[0].command;
+
+  // 关键：不能出现具体版本号，否则插件升级后失效
+  assert.doesNotMatch(cmd, /1\.0\.0/, "命令里不应出现写死的版本号");
+  assert.match(cmd, /\*\/cc-toolkit\/\*/, "市场名与版本号都应留成通配符");
+  assert.match(cmd, /cc-hook\.js/, "应指向 hook 脚本");
+  assert.equal(settings.hooks.Stop[0].hooks[0].type, "command");
+});
+
+test("cc-install-hook: 重复执行不追加第二条，只更新已有那条", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  runInstall([], cfg);
+  const out2 = runInstall([], cfg);
+
+  const settings = JSON.parse(fs.readFileSync(path.join(cfg, "settings.json"), "utf8"));
+  assert.equal(settings.hooks.Stop.length, 1, "不应出现重复 hook");
+  assert.match(out2, /已更新/);
+});
+
+test("cc-install-hook: 保留用户已有的其他 hook", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  const file = path.join(cfg, "settings.json");
+  const mine = { type: "command", command: "node /somewhere/else/user-script.js" };
+  fs.writeFileSync(file, JSON.stringify({ hooks: { Stop: [{ hooks: [mine] }] }, model: "x" }));
+
+  runInstall([], cfg);
+
+  const settings = JSON.parse(fs.readFileSync(file, "utf8"));
+  const all = settings.hooks.Stop.flatMap((g) => g.hooks);
+  assert.ok(all.some((h) => h.command === mine.command), "用户原有的 hook 必须保留");
+  assert.ok(all.some((h) => h.command.includes("cc-hook.js")), "本插件的 hook 应被加入");
+  assert.equal(settings.model, "x", "其他顶层字段不受影响");
+});
+
+test("cc-install-hook: --print 只预览不落盘", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  const out = runInstall(["--print"], cfg);
+
+  assert.doesNotThrow(() => JSON.parse(out), "预览应是合法 JSON");
+  assert.equal(fs.existsSync(path.join(cfg, "settings.json")), false, "不应写文件");
+});
+
+test("cc-install-hook: --uninstall 只移除本插件的 hook", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  const file = path.join(cfg, "settings.json");
+  const theirs = { type: "command", command: "node /elsewhere/theirs.js" };
+  fs.writeFileSync(file, JSON.stringify({ hooks: { Stop: [{ hooks: [theirs] }] } }));
+  runInstall([], cfg);
+
+  runInstall(["--uninstall"], cfg);
+
+  const settings = JSON.parse(fs.readFileSync(file, "utf8"));
+  const all = ((settings.hooks && settings.hooks.Stop) || []).flatMap((g) => g.hooks || []);
+  assert.equal(all.length, 1);
+  assert.equal(all[0].command, theirs.command, "别人的 hook 必须留下");
+});
+
+test("cc-install-hook: 卸载后 hooks 为空则整个键被清掉", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  runInstall([], cfg);
+  runInstall(["--uninstall"], cfg);
+
+  const settings = JSON.parse(fs.readFileSync(path.join(cfg, "settings.json"), "utf8"));
+  assert.equal(settings.hooks, undefined, "没有 hook 了就不该留空壳");
+});
+
+test("cc-install-hook: 插件目录找不到时非 0 退出", () => {
+  const cfg = fs.mkdtempSync(path.join(tmpRoot, "empty2-"));
+  assert.throws(
+    () => runInstall([], cfg),
+    (err) => {
+      assert.match(String(err.stderr), /找不到 cc-toolkit 插件目录/);
+      return err.status === 1;
+    }
+  );
+});
+
+test("cc-install-hook: 生成的命令能被 bash 正确解析（语法自洽）", () => {
+  const cfg = fakeConfigDir({ market: "cc-plugins", version: "1.0.0" });
+  runInstall([], cfg);
+
+  const settings = JSON.parse(fs.readFileSync(path.join(cfg, "settings.json"), "utf8"));
+  const cmd = settings.hooks.Stop[0].hooks[0].command;
+
+  // 交给 bash -n 做语法检查，避免引号嵌套写错却无人发现
+  const res = require("child_process").spawnSync("bash", ["-n", "-c", cmd], { encoding: "utf8" });
+  if (res.error && res.error.code === "ENOENT") return; // 没有 bash 就跳过
+  assert.equal(res.status, 0, `bash 语法检查失败: ${res.stderr}`);
+});
+
 // ── 端到端：CLI ─────────────────────────────────────────────────────────
 
 test("CLI --report: 输出含表头、样本行与统计事实", () => {
