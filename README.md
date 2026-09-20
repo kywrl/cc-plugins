@@ -2,24 +2,45 @@
 
 实时监控 **Claude Code 的输出速度（tok/s）**。
 
-装好即在每轮回复后看到本轮速度；`/cc-toolkit:tps` 查看历史分布、趋势与离群样本；可选把读数放进状态栏。
+装好即在每轮回复后看到本轮速度；`/cc-toolkit:tps` 查看历史分布、趋势、离群样本与分层归因；可选把读数放进状态栏。
 零 npm 依赖、纯本地计算、不联网、不上报。
 
 ```
-⚡ 本轮 89 tok/s  (349 tok / 3.9s)  ·  近8条中位 151 tok/s
+⚡ 本轮 89 tok/s / 3.9s · 首字 3.2s · 解码 142 · 缓存 92%  ·  近8条中位 151 tok/s
 ```
+
+关键是把**首字等待**和**纯解码速度**分开报 —— 合成一个数字时，prompt 变长会被误读成"模型变慢"。
 
 ```text
 $ /cc-toolkit:tps
 会话 25ac6b0e  项目 D--workspace-cc-toolkit
-当前（流式进行中）: ≈44 tok/s  141 tok / 3.2s
+当前（最近一轮，已结束）: 44 tok/s  141 tok / 3.2s
+  拆分: 首字 1.9s · 解码 88 tok/s (跨 1.3s)
+  缓存命中 92%
 最近 5 条已完成的响应:
-  01:44:42     696 tok /   4.6s =  151 tok/s
-  01:44:46     332 tok /   3.4s =   99 tok/s
-  01:44:54    1657 tok /   7.8s =  212 tok/s
-  01:45:01    1331 tok /   7.2s =  184 tok/s
-  01:45:05     349 tok /   3.9s =   89 tok/s
+  01:44:42    696 tok /   4.6s =  151 tok/s 解码 210 首字2.4s
+  01:44:46    332 tok /   3.4s =   99 tok/s 解码 165 首字1.5s
+  01:44:54   1657 tok /   7.8s =  212 tok/s 解码 331 首字2.6s
+  01:45:01   1331 tok /   7.2s =  184 tok/s 解码 288 首字3.1s
+  01:45:05    349 tok /   3.9s =   89 tok/s 解码 142 首字3.2s
 中位 151 tok/s | p90 212 | 最快 212 (01:44:54) | 最慢 89 (01:45:05)
+纯解码口径（5/5 条可拆分）: 中位 227 tok/s | 首字中位 2.6s
+```
+
+`--insights` 还能按 effort 档位 / 模型 / 技能 / MCP 服务分组对比，并给出缓存命中、API 重试、截断等会话级事实：
+
+```text
+$ /cc-toolkit:tps --insights
+── 指标分层 ──
+  按 effort 档位:
+    xhigh 32 / 解码 227 tok/s (n=173)
+    high  41 / 解码 312 tok/s (n=88)
+  按是否带 thinking:
+    带 thinking 块 43 / 解码 253 tok/s (n=76)
+    无 thinking 块 24 / 解码 111 tok/s (n=97)
+── 会话级事实 ──
+缓存: 173 条可测，中位命中 43%  ⚠ 94 条低于 50%
+API 错误: 3 次 [ECONNRESET×3]，其中 3 次触发了重试
 ```
 
 ---
@@ -27,8 +48,7 @@ $ /cc-toolkit:tps
 ## 目录
 
 - [为什么需要它](#为什么需要它)
-- [安装方法](#安装方法)
-- [hooks 配置方法](#hooks-配置方法)
+- [安装方法](#安装方法)- [hooks 配置方法](#hooks-配置方法)
 - [斜杠命令](#斜杠命令)
 - [状态栏集成（可选）](#状态栏集成可选)
 - [环境变量开关](#环境变量开关)
@@ -285,7 +305,7 @@ echo '{"session_id":"t","transcript_path":"/path/to/session.jsonl","hook_event_n
 
 | 命令 | 作用 |
 | --- | --- |
-| `/cc-toolkit:tps [条数]` | 多行快照：当前一轮 + 最近 N 条 + 中位/p90/最快/最慢 + 趋势与离群样本。参数默认 10，可加 `--all` 回放整个会话文件 |
+| `/cc-toolkit:tps [条数]` | 多行快照：当前一轮 + **首字等待/纯解码拆分** + 最近 N 条 + 中位/p90/最快/最慢 + 趋势与离群样本，并附**分层归因**（按 effort / 模型 / 技能 / MCP / 是否带 thinking 分组对比）与会话级事实（缓存命中、API 重试、截断）。参数默认 10，可加 `--all` 回放整个会话文件 |
 | `/cc-toolkit:tps-live [参数]` | 生成实时监视命令（前台长驻，Ctrl-C 退出）。可选 `--interval=500`、`-p 项目目录名` |
 | `/cc-toolkit:tps-doctor` | 环境自检：Node 版本、会话目录、能否定位当前会话、插件路径解析、hook / 状态栏该往哪配 |
 | `/cc-toolkit:install-hook` | 把 Stop hook 写进 `settings.json`（插件 hook 没生效、或想统一管理 hook 时用）。`--print` 预览、`--uninstall` 移除、`--project` 写进当前项目 |
@@ -310,6 +330,7 @@ node plugins/cc-toolkit/scripts/cc-watch.js --json --history=5
 | --- | --- |
 | （无参数） | 实时监视，默认 800ms 刷新 |
 | `--report` | 打印多行快照 + 统计事实后退出 |
+| `--insights` | 打印分层对比 + 会话级事实（归因 / 缓存 / 重试 / 截断） |
 | `--once` | 只打印一行汇总后退出 |
 | `--json` | 输出结构化 JSON，便于接别的脚本 |
 | `--history=N` | 快照里显示最近 N 条（默认 10） |
@@ -349,7 +370,15 @@ node plugins/cc-toolkit/scripts/cc-watch.js --json --history=5
 }
 ```
 
-输出形如 `⚡ 89 tok/s (中位 151)`。
+输出形如 `⚡ 89 tok/s · 首字 3.2s · 缓存 92%`。
+
+显示哪些字段可以用 `CC_TOOLKIT_STATUSLINE_FIELDS` 控制（逗号分隔）：
+`tps`（整轮速度）、`median`（近 9 条中位）、`ttft`（首字等待）、`decode`（纯解码）、`cache`（缓存命中）。
+默认 `tps,ttft,cache`。例如只想要一个数字：
+
+```json
+{ "env": { "CC_TOOLKIT_STATUSLINE_FIELDS": "tps" } }
+```
 
 如果你已经有自己的状态栏脚本了，不想换掉整个 statusLine，可以让它内部调一下本脚本：
 
@@ -375,10 +404,15 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 | --- | --- | --- |
 | `CC_TOOLKIT_DISABLE` | — | 设为 `1` 完全禁用（hook 与状态栏都静默退出） |
 | `CC_TOOLKIT_MIN_TOKENS` | `30` | 低于该 token 数不报告，避免"嗯"一声也弹个数。**只作用于本轮读数**，不影响中位数等统计聚合 |
-| `CC_TOOLKIT_QUIET` | — | 设为 `1` 只在明显偏慢时才提示，平时安静 |
+| `CC_TOOLKIT_SHOW` | `tps,ttft,decode,cache,median` | 每轮那行包含哪些字段。可选 `tps` `tokens` `ttft` `decode` `cache` `median` `thinking` `model` `effort` `skill`。例如只留速度：`CC_TOOLKIT_SHOW=tps` |
+| `CC_TOOLKIT_ALERTS` | 开 | 设为 `0` 关掉附加提示（max_tokens 截断 / refusal / 缓存命中过低 / API 重试） |
+| `CC_TOOLKIT_NOTIFY` | — | 设为 `1` 在偏慢时发一条桌面通知（OSC 777，需终端支持） |
+| `CC_TOOLKIT_NOTIFY_MIN_MS` | `60000` | 两次桌面通知的最小间隔 |
+| `CC_TOOLKIT_QUIET` | — | 设为 `1` 只在明显偏慢时才提示，平时安静（慢速提示有 5 分钟冷却，不会每轮刷屏） |
 | `CC_TOOLKIT_SLOW_TOKENS_PER_SEC` | `20` | QUIET 模式下的"慢"阈值 |
 | `CC_TOOLKIT_VERBOSE` | — | 设为 `1` 把诊断信息写到 stderr |
 | `CC_TOOLKIT_STATUSLINE_PREFIX` | `⚡ ` | 状态栏前缀 |
+| `CC_TOOLKIT_STATUSLINE_FIELDS` | `tps,ttft,cache` | 状态栏显示哪些段 |
 | `CC_TOOLKIT_STATUSLINE_CACHE_MS` | `45000` | 状态栏缓存有效期（毫秒） |
 
 只想临时静音一轮，直接在 shell 里 `export CC_TOOLKIT_DISABLE=1` 再启动 Claude Code 即可。
@@ -408,14 +442,59 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 
 所有输出都用 `≈` 明确区分两者，不会拿估算值冒充精确值。usage 落盘后估算值会被自动替换掉。
 
+### 三个口径，别混着看
+
+一轮的耗时里混着两件性质完全不同的事：**prefill**（读 prompt）和 **decode**（写回答）。
+合成一个 tok/s 时，prompt 越长读数越低 —— 很容易被误读成"模型变慢了"。所以插件把它们分开报：
+
+| 口径 | 定义 | 实测（本机 3.6 万条响应） |
+| --- | --- | --- |
+| `tok/s` | 整轮 token ÷ 整轮耗时（含 prefill） | 中位 32–71 |
+| `首字`（TTFT） | 用户发出消息 → 首个内容块落盘 | 中位 **7.3s**，p90 23s |
+| `解码`（decode） | 首个内容块 → 最后一个内容块 | 中位 **227–486 tok/s** |
+
+**为什么整轮只有几十、解码却有几百**：差的就是首字等待那几秒。所以判断"模型快不快"要看解码，
+判断"这次等得久不久"要看首字。
+
+两个口径的趋势方向不一致时，几乎总是 prompt 长度变了（prefill 变重），不是模型解码变快慢 ——
+报表里会直接提示这一点。
+
+**`解码` 显示为空是正常的**：只有 ≥2 个内容块、且首末块间隔 ≥300ms 才算得出。
+实测 29% 的轮次时间戳只差 1–3ms（Claude Code 把多个块一次性写盘），这种根本没有可测区间，
+插件宁可留空也不报一个上百万 tok/s 的假数字。
+
 ### 其他口径
 
 - **耗时起点**：用"上一行日志的时间戳"，也就是用户发出消息的时刻，而不是第一个内容块落盘的时刻。
-  否则首块延迟（TTFT）会被漏掉，速度看起来偏快。
+  否则首字延迟（TTFT）会被漏掉，速度看起来偏快。
+- **缓存命中率**：`cache_read ÷ (cache_read + cache_creation + input)`。本机中位 89.7%，
+  掉到 50% 以下会单独提示 —— 那意味着 prompt 缓存没生效，首字等待和成本都会涨。
+- **thinking 占比**：`thinking_tokens ÷ output_tokens`，取自 usage 明细。
+  注意 thinking token **已经包含在** output_tokens 里，不是额外的量。
+  第三方 provider 通常不上报这个字段，此时显示为空，**不等于"模型没有思考"**。
 - **子代理不计入**：`isSidechain` 的行会被跳过，统计的是主会话自己的输出。
 - **样本过滤**：少于 50 token 或短于 300ms 的响应不进统计（噪声太大）。
+- **分层归因**：按 effort / 模型 / 技能 / MCP 服务 / 是否带 thinking 分组对比时，
+  会自动排掉时长超过 5 分钟的轮次（用户可能离开过，会污染"模型本事"类的指标），
+  并且每组样本量少于 3 条就不显示。跨组比较前先看 `n=`。
 - **实时刷新粒度**：流式过程中只有块落盘的那一刻数字才会动，所以实时模式看起来是"跳"的而不是连续滚动的。
 - **回放上限**：默认只回放会话文件末尾 2MB，避免超长会话拖慢启动。要全量用 `--all`。
+
+### 从日志里还能读到什么
+
+除了速度，插件还会顺带解析这些旁路信息（`--insights` 里能看到）：
+
+| 来源 | 能回答的问题 |
+| --- | --- |
+| `system/turn_duration` | Claude Code 自报的整轮耗时（用于交叉校验我们的推算值） |
+| `system/api_error` | 有没有网络抖动 / 重试，错误码是什么 |
+| `system/stop_hook_summary` | hook 到底跑了没有、有没有报错 |
+| `stop_reason: max_tokens` | 这一轮被截断了 —— token 数不是完整输出，速度也不代表全部 |
+| `usage.iterations[]` | 一次 API 调用内部循环了几轮 reasoning（仅官方 API 上报） |
+| `attributionSkill` / `attributionMcpServer` | 速度能按技能、MCP 工具、插件归因 |
+| `effort` / `perMessageEffort` | 不同 effort 档位的实际速度取舍 |
+
+注：`perTurnEffort` 这个字段目前在所有历史会话里都是 `null`，所以还没用上。
 
 ---
 

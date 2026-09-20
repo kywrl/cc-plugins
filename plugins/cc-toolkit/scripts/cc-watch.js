@@ -6,6 +6,7 @@
  * 用法:
  *   node scripts/cc-watch.js                # 实时监视（自动定位当前项目的会话）
  *   node scripts/cc-watch.js --report       # 打印多行快照后退出（给斜杠命令用）
+ *   node scripts/cc-watch.js --insights     # 指标分层 + 会话级事实（归因 / 缓存 / 重试）
  *   node scripts/cc-watch.js --once         # 只打印一行汇总后退出
  *   node scripts/cc-watch.js --json         # 输出结构化 JSON（给脚本 / 模型消费）
  *   node scripts/cc-watch.js <file.jsonl>   # 跟踪指定会话文件
@@ -30,8 +31,9 @@ function parseArgs(argv) {
   const historyRaw = parseInt(value("history", "10"), 10);
 
   return {
-    live: !flag("report") && !flag("once") && !flag("json"),
+    live: !flag("report") && !flag("once") && !flag("json") && !flag("insights"),
     report: flag("report"),
+    insights: flag("insights"),
     once: flag("once"),
     json: flag("json"),
     all: flag("all"),
@@ -80,39 +82,73 @@ function renderFacts(tracker) {
 function buildJson(tracker, opts) {
   const a = core.analyze(tracker, { window: opts.history });
   const snap = tracker.currentSpeed();
+  const roundOut = (d) => ({
+    at: d.at,
+    time: core.hhmmss(d.at),
+    tps: Number(d.tps.toFixed(2)),
+    tokens: Math.round(d.tokens),
+    seconds: Number((d.durMs / 1000).toFixed(2)),
+    estimated: d.estimated,
+    ttftMs: d.ttftMs == null ? null : Math.round(d.ttftMs),
+    ttftMeaningful: !!d.ttftMeaningful,
+    decodeTps: d.decodeTps > 0 ? Number(d.decodeTps.toFixed(2)) : null,
+    decodeMs: d.decodeMs == null ? null : Math.round(d.decodeMs),
+    decodeReason: d.decodeReason,
+    thinkingTokens: d.thinkingTokens,
+    // null = provider 没上报 thinking_tokens 明细，不是「占比为 0」
+    thinkingShare: d.thinkingShare == null ? null : Number(d.thinkingShare.toFixed(4)),
+    blocks: d.blocks,
+    iterations: d.iterations.length,
+    cacheHitRatio: d.cache ? Number(d.cache.hitRatio.toFixed(4)) : null,
+    model: d.model,
+    effort: d.effort,
+    skill: d.skill,
+    mcp: d.mcp,
+    plugin: d.plugin,
+    stopReason: d.stopReason,
+    stoppedByLimit: d.stoppedByLimit,
+  });
+  const statsOut = (s) =>
+    s
+      ? {
+          count: s.count,
+          median: Number(s.median.toFixed(2)),
+          mean: Number(s.mean.toFixed(2)),
+          p90: Number(s.p90.toFixed(2)),
+          best: Number(s.best.tps.toFixed(2)),
+          worst: Number(s.worst.tps.toFixed(2)),
+          medianDecodeTps: s.medianDecodeTps == null ? null : Number(s.medianDecodeTps.toFixed(2)),
+          decodeCount: s.decodeCount,
+          medianTtftMs: s.medianTtftMs == null ? null : Math.round(s.medianTtftMs),
+          p90TtftMs: s.p90TtftMs == null ? null : Math.round(s.p90TtftMs),
+        }
+      : null;
+
   return {
     session: a.sessionId,
     project: a.project,
     file: tracker.file,
-    current: snap
-      ? {
-          tps: Number(snap.tps.toFixed(2)),
-          tokens: Math.round(snap.tokens),
-          estimated: snap.estimated,
-          streaming: snap.streaming,
-          seconds: Number(snap.denom.toFixed(2)),
-        }
-      : null,
-    samples: tracker.recentSamples(opts.history).map((d) => ({
-      at: d.at,
-      time: core.hhmmss(d.at),
-      tps: Number(d.tps.toFixed(2)),
-      tokens: Math.round(d.tokens),
-      seconds: Number((d.durMs / 1000).toFixed(2)),
-      estimated: d.estimated,
-    })),
-    stats: a.overall
-      ? {
-          count: a.overall.count,
-          median: Number(a.overall.median.toFixed(2)),
-          mean: Number(a.overall.mean.toFixed(2)),
-          p90: Number(a.overall.p90.toFixed(2)),
-          best: Number(a.overall.best.tps.toFixed(2)),
-          worst: Number(a.overall.worst.tps.toFixed(2)),
-          trendPct: a.trendPct == null ? null : Number(a.trendPct.toFixed(1)),
-          estimatedShare: Number(a.estimatedShare.toFixed(3)),
-        }
-      : null,
+    current: snap ? roundOut(snap) : null,
+    samples: tracker.recentSamples(opts.history).map(roundOut),
+    stats: statsOut(a.overall),
+    recent: statsOut(a.recent),
+    earlier: statsOut(a.earlier),
+    trendPct: a.trendPct == null ? null : Number(a.trendPct.toFixed(1)),
+    decodeTrendPct: a.decodeTrendPct == null ? null : Number(a.decodeTrendPct.toFixed(1)),
+    estimatedShare: Number(a.estimatedShare.toFixed(3)),
+    // 分层对比：每个维度下样本量 ≥3 的分组
+    breakdown: {
+      skippedLong: a.breakdown.skippedLong,
+      byEffort: a.breakdown.byDifficulty,
+      byModel: a.breakdown.byModel,
+      bySkill: a.breakdown.bySkill,
+      byMcp: a.breakdown.byMcp,
+      byPlugin: a.breakdown.byPlugin,
+      byThinking: a.breakdown.byThinking,
+      byToolUse: a.breakdown.byToolUse,
+      byFirstBlock: a.breakdown.byFirstBlock,
+    },
+    sessionFacts: a.session,
   };
 }
 
@@ -144,6 +180,11 @@ function main() {
   if (opts.report) {
     process.stdout.write(core.renderReport(tracker, { history: opts.history }) + "\n");
     process.stdout.write(renderFacts(tracker) + "\n");
+    return;
+  }
+
+  if (opts.insights) {
+    process.stdout.write(core.renderInsights(tracker, { limit: opts.history > 10 ? opts.history : 5 }) + "\n");
     return;
   }
 

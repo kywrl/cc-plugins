@@ -4,6 +4,57 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-09-20
+
+这一版把「一个 tok/s」拆成能分别回答不同问题的几个数字，并开始把会话日志里的旁路信息
+（缓存、重试、截断、归因）用起来。
+
+### 新增
+
+- **首字等待与纯解码速度分开报。** 一轮的耗时里混着 prefill（读 prompt）和 decode（写回答）——
+  合成一个数字时，prompt 越长读数越低，很容易被误读成「模型变慢」。
+  现在每轮同时给出 `首字 X.Xs`（用户发消息 → 首个内容块落盘）与 `解码 N tok/s`
+  （首块 → 末块，唯一不含 prefill 的口径）。本机实测：整轮中位 32–71 tok/s，
+  但首字中位 7.3s、纯解码中位 227–486 tok/s——差的正是那几秒等待。
+- **缓存命中率。** `cache_read ÷ (cache_read + cache_creation + input)`，本机中位 89.7%。
+  可放进状态栏，低于 50% 时单独告警（prompt 缓存没生效，首字等待和成本都会涨）。
+- **thinking token 占比与 iterations 明细。** thinking 是 output 的子集，不是额外的量；
+  一次 API 调用内部的 reasoning 循环次数从 `usage.iterations` 读出（仅官方 API 上报）。
+- **分层归因（`--insights`）**：按 effort 档位 / 模型 / 技能 / MCP 服务 / 插件 /
+  是否带 thinking / 是否调用工具 / 首块类型分组对比速度与首字等待。
+  自动排掉超过 5 分钟的轮次（用户可能离开过），且每组样本量 <3 不显示。
+- **会话级事实**：从 `system/turn_duration`、`system/api_error`、`system/stop_hook_summary`
+  读出 CLI 自报耗时、API 重试与错误码、hook 自身的执行情况。
+- **告警**：`max_tokens` 截断、`refusal`、缓存命中过低、本轮期间发生 API 重试，
+  都会在读数下面加一行说明——这些情况下的「慢」各有成因，不该只报一个数字。
+- **可选的桌面通知**（`CC_TOOLKIT_NOTIFY=1`）：偏慢时通过 hook 的 `terminalSequence`
+  发一条 OSC 777 通知，带冷却时间。
+- 新环境变量 `CC_TOOLKIT_SHOW`（裁剪每轮那行的字段）、`CC_TOOLKIT_ALERTS`、
+  `CC_TOOLKIT_NOTIFY`、`CC_TOOLKIT_STATUSLINE_FIELDS`；QUIET 模式的慢速提示增加 5 分钟冷却。
+- `cc-doctor` 增加指标可用性检查：能否算出纯解码、缓存是否可测、
+  以及 provider 是否上报 `thinking_tokens`。
+
+### 修复
+
+- **纯解码速度在块被一次性写盘时会算出荒谬值。** Claude Code 常把一轮的多个内容块
+  一次性写入，时间戳只差 1–3ms。实测 11791 个可拆分轮次里有 3438 个（29%）跨度 <300ms，
+  按 `token ÷ 跨度` 会得出上百万 tok/s。现在跨度 <300ms 一律不报解码速度（返回 `null`），
+  而不是给一个会被当真的数字。
+- **第三方 provider 下的分子分母错配。** 这类 provider 只在末尾若干块写 usage，
+  且写的是**累计总数**（如 `0,0,1573,1573`）。旧代码用「最大值 ÷ 到带 usage 那块的耗时」，
+  分子是最终总数、分母却是中途时间，读数偏高。现在统一算到最后一块，
+  且轮次起点改用上一条 `user` 行（而非上一条任意记录），避免 tool_result / attachment 把起点推后。
+- `thinkingShare` 在 provider 不上报该字段时返回 `null` 而非 `0`——
+  「没上报」和「占比为零」是两回事，`0` 会被读成「模型没有思考」。
+
+### 变更
+
+- **状态栏缓存版本 v1 → v2**（字段语义已变，旧的 tps 是含 prefill 的口径）。
+  读取时会拒绝 v1 缓存并从 transcript 重算，不会显示错误数字。
+- `--once` / 实时模式不再重复展示「上一条」样本（与中位数信息冗余）。
+- 状态栏默认输出改为 `⚡ 89 tok/s · 首字 3.2s · 缓存 92%`，原有 `(中位 N)` 需显式
+  用 `CC_TOOLKIT_STATUSLINE_FIELDS` 打开。
+
 ## [1.0.1] - 2026-09-20
 
 ### 修复

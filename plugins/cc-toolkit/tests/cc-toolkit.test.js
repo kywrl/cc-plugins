@@ -88,6 +88,41 @@ function run(script, args, { input, env } = {}) {
   });
 }
 
+/**
+ * 按行改一份 transcript 再写回。
+ *
+ * 比在整份文本上做正则替换可靠：正则很容易被 JSON 里的引号、
+ * 嵌套括号和行尾换行搞错，而且改错了不会报错，只会静默地什么都不改。
+ */
+function patchLines(file, fn) {
+  const rows = fs
+    .readFileSync(file, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => {
+      const r = JSON.parse(l);
+      return fn(r) || r;
+    });
+  fs.writeFileSync(file, rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+  return file;
+}
+
+/** 给所有 assistant 行补 usage 字段，返回被改写的那一轮 */
+function patchUsage(file, extra) {
+  patchLines(file, (r) => {
+    if (r.type !== "assistant") return r;
+    r.message.usage = { ...(r.message.usage || {}), ...extra };
+    return r;
+  });
+  return file;
+}
+
+/** 给所有 assistant 行设一个顶层字段 */
+function patchAssistant(file, extra) {
+  patchLines(file, (r) => (r.type === "assistant" ? { ...r, ...extra } : r));
+  return file;
+}
+
 // ── 单元测试 ────────────────────────────────────────────────────────────
 
 test("estimateTokens: CJK 按 1.5 字符/token，拉丁按 4 字符/token", () => {
@@ -299,11 +334,25 @@ test("缓存：写入后可按 sessionId 读回，过期则失效", () => {
   const id = `cache-${Math.random().toString(36).slice(2)}`;
   assert.equal(core.readCache(id), null, "还没写时应为 null");
 
-  core.writeCache(id, { v: 1, at: Date.now(), samples: [{ tps: 1 }] });
+  core.writeCache(id, { v: 2, at: Date.now(), samples: [{ tps: 1 }] });
   assert.deepEqual(core.readCache(id).samples, [{ tps: 1 }]);
 
-  // maxAgeMs = 0 → 立刻过期
-  assert.equal(core.readCache(id, 0), null);
+  // 过期判定要显式造一个旧时间戳：用 maxAgeMs=0 会依赖「写入与读取至少差 1ms」，
+  // 同一毫秒内完成时不会过期，测试会随机失败。
+  core.writeCache(id, { v: 2, at: Date.now() - 10_000, samples: [{ tps: 1 }] });
+  assert.equal(core.readCache(id, 1000), null, "超过 maxAgeMs 应失效");
+  assert.notEqual(core.readCache(id, 60_000), null, "未超期则仍可读");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
+test("缓存：v1 旧格式被拒绝（字段语义已变，宁可不显示也不显示错的）", () => {
+  const id = `cache-v1-${Math.random().toString(36).slice(2)}`;
+  fs.writeFileSync(
+    core.cacheFileFor(id),
+    JSON.stringify({ v: 1, at: Date.now(), samples: [{ tps: 999 }] }),
+    "utf8"
+  );
+  assert.equal(core.readCache(id), null, "v1 缓存必须当作没有");
   fs.rmSync(core.cacheFileFor(id), { force: true });
 });
 
@@ -630,7 +679,109 @@ test("hook: 短回复（低于统计下限但高于 CC_TOOLKIT_MIN_TOKENS）仍�
   assert.notEqual(out, "", "短回复不该静默");
   const payload = JSON.parse(out);
   assert.match(payload.systemMessage, /⚡ 本轮 19 tok\/s/);
-  assert.match(payload.systemMessage, /46 tok \/ 2\.4s/);
+  assert.match(payload.systemMessage, /2\.4s/, "应带上本轮耗时");
+});
+
+test("hook: 默认把首字等待与纯解码分开报（不再只给一个合成数字）", () => {
+  // 3 个块、每块间隔 800ms：整轮 2.4s，但纯解码跨度只有 1.6s。
+  // 合成一个 tok/s 会让 prefill 被误读成模型变慢，所以两个口径都要在。
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }]);
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: "split-session", transcript_path: file }),
+  });
+  const msg = JSON.parse(out).systemMessage;
+  assert.match(msg, /首字 \d+\.\d+s/, "应报告首字等待（TTFT）");
+  assert.match(msg, /解码 \d+/, "应报告纯解码速度");
+});
+
+test("hook: CC_TOOLKIT_SHOW 能裁剪输出行", () => {
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }]);
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: "show-session", transcript_path: file }),
+    env: { CC_TOOLKIT_SHOW: "tps" },
+  });
+  const msg = JSON.parse(out).systemMessage;
+  assert.match(msg, /tok\/s/);
+  assert.doesNotMatch(msg, /首字/, "首字不在 show 里就不该出现");
+  assert.doesNotMatch(msg, /解码/, "解码不在 show 里就不该出现");
+  assert.doesNotMatch(msg, /近\d+条中位/, "median 不在 show 里就不该出现");
+});
+
+test("hook: max_tokens 截断时给出告警", () => {
+  const file = writeTranscript([{ id: "m", ms: 2000, tokens: 400 }]);
+  patchLines(file, (r) => {
+    if (r.type !== "assistant") return r;
+    r.message.stop_reason = "max_tokens";
+    return r;
+  });
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: "trunc-session", transcript_path: file }),
+  });
+  assert.match(JSON.parse(out).systemMessage, /max_tokens 截断/);
+});
+
+test("hook: 缓存命中过低时给出告警", () => {
+  // 命中率 = read/(read+write+fresh) = 10/1010 ≈ 1%
+  const file = patchUsage(writeTranscript([{ id: "m", ms: 2000, tokens: 400 }]), {
+    input_tokens: 1000,
+    cache_read_input_tokens: 10,
+    cache_creation_input_tokens: 0,
+  });
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: "cache-alert-session", transcript_path: file }),
+  });
+  assert.match(JSON.parse(out).systemMessage, /prompt 缓存命中仅/);
+});
+
+test("hook: CC_TOOLKIT_ALERTS=0 时关掉告警", () => {
+  const file = writeTranscript([{ id: "m", ms: 2000, tokens: 400 }]);
+  patchLines(file, (r) => {
+    if (r.type !== "assistant") return r;
+    r.message.stop_reason = "max_tokens";
+    return r;
+  });
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: "noalert-session", transcript_path: file }),
+    env: { CC_TOOLKIT_ALERTS: "0" },
+  });
+  assert.doesNotMatch(JSON.parse(out).systemMessage, /截断/);
+});
+
+test("hook: QUIET 模式下慢速提示有冷却，不会每轮刷屏", () => {
+  const id = `cool-${Math.random().toString(36).slice(2)}`;
+  const file = writeTranscript([{ id: "m", ms: 5000, tokens: 100 }]); // 20 tok/s
+  const event = JSON.stringify({ session_id: id, transcript_path: file });
+  const env = { CC_TOOLKIT_QUIET: "1", CC_TOOLKIT_SLOW_TOKENS_PER_SEC: "40" };
+
+  assert.match(JSON.parse(run("cc-hook.js", [], { input: event, env })).systemMessage, /🐢/);
+  // 同一会话紧接着再来一次：应被冷却吃掉
+  assert.equal(run("cc-hook.js", [], { input: event, env }), "", "冷却期内不应重复提示");
+  fs.rmSync(path.join(os.tmpdir(), `cc-toolkit-state-${id}.json`), { force: true });
+});
+
+test("hook: CC_TOOLKIT_NOTIFY=1 且偏慢时附带桌面通知序列", () => {
+  const id = `notify-${Math.random().toString(36).slice(2)}`;
+  const file = writeTranscript([{ id: "m", ms: 5000, tokens: 100 }]); // 20 tok/s
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: id, transcript_path: file }),
+    env: { CC_TOOLKIT_NOTIFY: "1", CC_TOOLKIT_SLOW_TOKENS_PER_SEC: "40" },
+  });
+  const payload = JSON.parse(out);
+  assert.ok(payload.terminalSequence, "应带上 terminalSequence");
+  assert.match(payload.terminalSequence, /^\x1b\]777;notify;/, "应为 OSC 777 通知序列");
+  assert.match(payload.terminalSequence, /\x07$/, "应以 BEL 结束");
+  fs.rmSync(path.join(os.tmpdir(), `cc-toolkit-state-${id}.json`), { force: true });
+});
+
+test("hook: 默认不发桌面通知（不打扰）", () => {
+  const id = `nonotify-${Math.random().toString(36).slice(2)}`;
+  const file = writeTranscript([{ id: "m", ms: 5000, tokens: 100 }]);
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: id, transcript_path: file }),
+    env: { CC_TOOLKIT_SLOW_TOKENS_PER_SEC: "40" },
+  });
+  assert.equal(JSON.parse(out).terminalSequence, undefined);
+  fs.rmSync(path.join(os.tmpdir(), `cc-toolkit-state-${id}.json`), { force: true });
 });
 
 test("hook: CC_TOOLKIT_MIN_TOKENS 高于本轮时仍然静默", () => {
@@ -660,18 +811,307 @@ test("snapshot: 缓存里带 lastRound，且不经统计过滤", () => {
   assert.equal(snap.lastRound.tokens, 46);
 });
 
-test("statusline: 旧版缓存（无 lastRound 字段）仍能读出读数", () => {
+test("statusline: v1 旧缓存被忽略后，仍能从 transcript 重算出读数", () => {
   const id = `legacy-${Math.random().toString(36).slice(2)}`;
-  // 模拟旧版写的缓存：只有 samples，没有 lastRound
-  core.writeCache(id, {
-    v: 1,
-    at: Date.now(),
-    samples: [{ tokens: 400, durMs: 2000, tps: 200, estimated: false, at: Date.now() }],
+  const file = writeTranscript([{ id: "m", ms: 2000, tokens: 400 }], { name: "sl-legacy.jsonl" });
+  // 写一份 v1 缓存：里面的 tps 是旧口径（含 prefill），不能信
+  fs.writeFileSync(
+    core.cacheFileFor(id),
+    JSON.stringify({
+      v: 1,
+      at: Date.now(),
+      samples: [{ tokens: 9999, durMs: 1000, tps: 9999, estimated: false, at: Date.now() }],
+    }),
+    "utf8"
+  );
+
+  const out = run("cc-statusline.js", [], {
+    input: JSON.stringify({ session_id: id, transcript_path: file }),
+  });
+  assert.doesNotMatch(out, /9999/, "不该复用 v1 缓存里的数字");
+  assert.match(out, /⚡ 200 tok\/s/, "应从 transcript 重算出真实读数");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
+test("SessionTracker: 拆分首字等待(TTFT)与纯解码速度", () => {
+  // 3 个块，每块间隔 800ms：整轮 2.4s / 400 tok = 167 tok/s，
+  // 但首字等了 800ms，真正的解码跨度只有 1.6s → 250 tok/s。
+  // 合成一个数字时，这个差别会被完全掩盖。
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }]);
+  const tracker = new core.SessionTracker(file).start();
+  const r = tracker.latestRound({ force: true });
+
+  assert.equal(r.durMs, 2400);
+  assert.equal(r.ttftMs, 800, "首字等待 = 本轮起点 → 第一个块");
+  assert.equal(r.decodeMs, 1600, "解码跨度 = 首块 → 末块");
+  assert.equal(Math.round(r.tps), 167, "整轮口径含 prefill");
+  assert.equal(Math.round(r.decodeTps), 250, "纯解码口径不含 prefill");
+  assert.ok(r.decodeTps > r.tps, "拆开后解码速度应高于合成值");
+});
+
+test("SessionTracker: 单块回复无法拆分 decode，decodeTps 为 null", () => {
+  // 只有一个内容块时，首块即末块，没有可测的解码跨度。
+  // 这时必须诚实地返回 null，而不是拿整轮速度冒充解码速度。
+  const file = writeTranscript([{ id: "m", ms: 2000, tokens: 400, chunks: 1 }]);
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+
+  assert.equal(r.blocks, 1);
+  assert.equal(r.decodeTps, null, "单块无法拆分");
+  assert.equal(r.decodeMs, null);
+  assert.equal(r.decodeReason, "single-block");
+  assert.ok(r.tps > 0, "整轮速度仍然可用");
+});
+
+test("SessionTracker: 单块回复的首字等待被标记为无意义", () => {
+  // 单块回复里首块即末块，ttft 恒等于整轮耗时。把它和「整轮 2.0s」一起显示
+  // 只是重复，看起来像算错了 —— 所以标记出来，由渲染层决定不显示。
+  const single = writeTranscript([{ id: "m", ms: 2000, tokens: 400, chunks: 1 }]);
+  const r1 = new core.SessionTracker(single).start().latestRound({ force: true });
+  assert.equal(r1.ttftMs, 2000, "首字等待等于整轮耗时");
+  assert.equal(r1.ttftMeaningful, false, "没有后续内容 → 首字等待无展示意义");
+
+  // 多个块、跨度足够时才有意义
+  const multi = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }]);
+  const r2 = new core.SessionTracker(multi).start().latestRound({ force: true });
+  assert.equal(r2.ttftMeaningful, true);
+});
+
+test("SessionTracker: 块被一次性写盘时不报解码速度", () => {
+  // Claude Code 常把多个块一次性写盘，时间戳只差 1ms。
+  // 按 token/跨度 会算出上百万 tok/s —— 必须报 null 而不是假数字。
+  const dir = fs.mkdtempSync(path.join(tmpRoot, "burst-"));
+  const file = path.join(dir, "burst.jsonl");
+  const t0 = Date.parse("2026-01-01T00:00:00Z");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ type: "user", timestamp: new Date(t0).toISOString(), message: { role: "user", content: "p" } }) +
+      "\n" +
+      [
+        { t: 5000, b: "thinking" },
+        { t: 5001, b: "text" },
+        { t: 5002, b: "tool_use" },
+      ]
+        .map((x) =>
+          JSON.stringify({
+            type: "assistant",
+            timestamp: new Date(t0 + x.t).toISOString(),
+            message: { id: "msg_burst", role: "assistant", content: [{ type: x.b }], usage: { output_tokens: 2406 } },
+          })
+        )
+        .join("\n") +
+      "\n",
+    "utf8"
+  );
+
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+  assert.equal(r.blocks, 3);
+  assert.equal(r.decodeMs, 2, "跨度只有 2ms");
+  assert.equal(r.decodeTps, null, "跨度太短 → 不报解码速度");
+  assert.equal(r.decodeReason, "not-measurable");
+  assert.ok(r.tps < 1000, "整轮口径不会被这种轮次污染");
+  assert.equal(r.ttftMeaningful, false);
+});
+
+test("SessionTracker: 解析 thinking token 数与占比", () => {
+  const file = patchUsage(
+    writeTranscript([{ id: "m", ms: 2000, tokens: 400, chunks: 2 }]),
+    { output_tokens_details: { thinking_tokens: 300 } } // thinking 是 output 的子集
+  );
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+
+  assert.equal(r.thinkingTokens, 300);
+  assert.equal(r.thinkingShare, 0.75);
+  assert.equal(r.tokens, 400, "thinking 不该被加进总 token 里（它是子集）");
+});
+
+test("SessionTracker: thinking_tokens 大于 output_tokens 时被 clamp", () => {
+  // 实测 29509 行里有 7 行出现这种越界，直接除会得到 >100% 的荒谬占比
+  const file = patchUsage(writeTranscript([{ id: "m", ms: 2000, tokens: 100, chunks: 2 }]), {
+    output_tokens_details: { thinking_tokens: 999 },
+  });
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+  assert.equal(r.thinkingTokens, 100, "应被 clamp 到 output_tokens");
+  assert.equal(r.thinkingShare, 1);
+});
+
+test("SessionTracker: 解析缓存命中率与分层字段", () => {
+  const file = writeTranscript([{ id: "m", ms: 2000, tokens: 400, chunks: 2 }]);
+  patchUsage(file, {
+    input_tokens: 1000,
+    cache_read_input_tokens: 8000,
+    cache_creation_input_tokens: 1000,
+    cache_creation: { ephemeral_5m_input_tokens: 1000, ephemeral_1h_input_tokens: 0 },
+  });
+  patchAssistant(file, { effort: "xhigh", attributionSkill: "code-review" });
+  patchLines(file, (r) => {
+    if (r.type !== "assistant") return r;
+    r.message.model = "claude-opus-5";
+    r.message.stop_reason = "end_turn";
+    return r;
   });
 
-  const out = run("cc-statusline.js", [], { input: JSON.stringify({ session_id: id }) });
-  assert.match(out, /⚡ 200 tok\/s/, "应回退到 samples 末条");
-  fs.rmSync(core.cacheFileFor(id), { force: true });
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+  assert.equal(r.cache.read, 8000);
+  assert.equal(r.cache.write, 1000);
+  assert.equal(r.cache.fresh, 1000);
+  assert.equal(r.cache.hitRatio, 0.8, "8000 / (8000+1000+1000)");
+  assert.equal(r.cache.ephemeral5m, 1000);
+  assert.equal(r.effort, "xhigh");
+  assert.equal(r.model, "claude-opus-5");
+  assert.equal(r.skill, "code-review");
+  assert.equal(r.stopReason, "end_turn");
+  assert.equal(r.stoppedByLimit, false);
+});
+
+test("SessionTracker: 累计式 usage（第三方 provider）不会让读数虚高", () => {
+  // 第三方 provider 只在末尾块写总数（0,0,1573,1573），且末块时间戳
+  // 可能早于最后一个内容块。若用「max 值 ÷ 到带 usage 那块的耗时」，
+  // 分子分母就会错配，算出偏高的速度。
+  const dir = fs.mkdtempSync(path.join(tmpRoot, "prov-"));
+  const file = path.join(dir, "cumulative.jsonl");
+  const t0 = Date.parse("2026-01-01T00:00:00Z");
+  const line = (ms, usage) =>
+    JSON.stringify({
+      type: "assistant",
+      timestamp: new Date(t0 + ms).toISOString(),
+      message: { id: "msg_c", role: "assistant", content: [{ type: "text", text: "x".repeat(80) }], usage },
+    }) + "\n";
+
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ type: "user", timestamp: new Date(t0).toISOString(), message: { role: "user", content: "p" } }) +
+      "\n" +
+      line(500, { output_tokens: 0 }) +
+      line(1000, { output_tokens: 0 }) +
+      line(1500, { output_tokens: 1500 }) +
+      line(2000, { output_tokens: 1500 }), // 最后一个内容块
+    "utf8"
+  );
+
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+  assert.equal(r.tokens, 1500, "取的是累计总数（max），不是把每块相加");
+  assert.equal(r.durMs, 2000, "耗时算到最后一块，而不是带 usage 的那块");
+  assert.equal(r.blocks, 4);
+  assert.equal(Math.round(r.tps), 750, "1500 tok / 2s");
+});
+
+test("SessionTracker: max_tokens 截断与 refusal 被标记", () => {
+  const mk = (reason, name) => {
+    const file = writeTranscript([{ id: "m", ms: 2000, tokens: 400 }], { name });
+    patchLines(file, (r) => {
+      if (r.type !== "assistant") return r;
+      r.message.stop_reason = reason;
+      return r;
+    });
+    return new core.SessionTracker(file).start().latestRound({ force: true });
+  };
+  assert.equal(mk("max_tokens", "mt.jsonl").stoppedByLimit, true);
+  assert.equal(mk("refusal", "rf.jsonl").refused, true);
+  assert.equal(mk("end_turn", "et.jsonl").stoppedByLimit, false);
+});
+
+test("SessionTracker: 解析 system 行的 api_error / turn_duration / hook 摘要", () => {
+  const file = writeTranscript([{ id: "m", ms: 2000, tokens: 400 }]);
+  fs.appendFileSync(
+    file,
+    [
+      JSON.stringify({
+        type: "system",
+        subtype: "api_error",
+        timestamp: "2026-01-01T00:10:00.000Z",
+        error: { message: "Connection error.", connection: { code: "ECONNRESET" } },
+        retryAttempt: 2,
+        maxRetries: 10,
+        source: "request_retry",
+      }),
+      JSON.stringify({
+        type: "system",
+        subtype: "turn_duration",
+        timestamp: "2026-01-01T00:11:00.000Z",
+        durationMs: 6373,
+        messageCount: 15,
+      }),
+      JSON.stringify({
+        type: "system",
+        subtype: "stop_hook_summary",
+        timestamp: "2026-01-01T00:12:00.000Z",
+        hookCount: 2,
+        hookInfos: [{ command: "node cc-hook.js" }],
+        hookErrors: [],
+        hasOutput: true,
+        preventedContinuation: false,
+      }),
+    ].join("\n") + "\n",
+    "utf8"
+  );
+
+  const t = new core.SessionTracker(file).start();
+  const f = t.sessionFacts();
+  assert.equal(f.apiErrors.count, 1);
+  assert.equal(f.apiErrors.byCode[0].code, "ECONNRESET");
+  assert.equal(f.apiErrors.retried, 1);
+  assert.equal(f.turnDurations.count, 1);
+  assert.equal(f.turnDurations.medianMs, 6373);
+  assert.equal(f.hookRuns.count, 1);
+  assert.equal(f.hookRuns.withOutput, 1);
+  assert.equal(f.hookRuns.withErrors, 0);
+});
+
+test("SessionTracker: 分层对比按 effort / 技能 / 工具调用切分", () => {
+  const rounds = [];
+  for (let i = 0; i < 4; i++) rounds.push({ id: `hi_${i}`, ms: 1000, tokens: 400 }); // 400 tok/s
+  for (let i = 0; i < 4; i++) rounds.push({ id: `lo_${i}`, ms: 4000, tokens: 400 }); // 100 tok/s
+  const file = writeTranscript(rounds, { name: "breakdown.jsonl" });
+
+  const rows = fs
+    .readFileSync(file, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  fs.writeFileSync(
+    file,
+    rows
+      .map((r) => {
+        if (r.type !== "assistant") return JSON.stringify(r);
+        const fast = r.message.id.startsWith("hi_");
+        r.effort = fast ? "low" : "xhigh";
+        r.attributionSkill = fast ? "quick-fix" : "deep-review";
+        // 慢的那些轮次带一个 tool_use 块
+        if (!fast) r.message.content = [...r.message.content, { type: "tool_use", id: "t1", name: "Bash", input: {} }];
+        return JSON.stringify(r);
+      })
+      .join("\n") + "\n",
+    "utf8"
+  );
+
+  const b = new core.SessionTracker(file).start().breakdown();
+  const low = b.byDifficulty.find((g) => g.key === "low");
+  const xhigh = b.byDifficulty.find((g) => g.key === "xhigh");
+  assert.equal(low.count, 4);
+  assert.equal(xhigh.count, 4);
+  assert.ok(low.medianTps > xhigh.medianTps, "low 档应明显更快");
+  assert.ok(b.bySkill.find((g) => g.key === "deep-review"), "应按技能分组");
+  assert.ok(b.byToolUse.find((g) => g.key === "含工具调用"), "应能区分是否调用工具");
+
+  // 样本量 <3 的分组应被过滤掉，避免过度解读
+  const plain = writeTranscript(
+    Array.from({ length: 4 }, (_, i) => ({ id: `p_${i}`, ms: 2000, tokens: 400 })),
+    { name: "thin-groups.jsonl" }
+  );
+  const thin = new core.SessionTracker(plain).start().breakdown();
+  assert.equal(thin.byDifficulty.length, 0, "没有 effort 字段就没有分组");
+  assert.equal(thin.bySkill.length, 0, "没有技能归因就没有分组");
+});
+
+test("analyze: 提供分层、会话事实与双口径趋势", () => {
+  const rounds = [];
+  for (let i = 0; i < 22; i++) rounds.push({ id: `m_${i}`, ms: 2000, tokens: 400, chunks: 3 });
+  const a = core.analyze(new core.SessionTracker(writeTranscript(rounds)).start());
+
+  assert.ok(a.breakdown, "应给出分层结果");
+  assert.ok(a.session, "应给出会话级事实");
+  assert.equal(typeof a.session.cache.sampleCount, "number");
+  assert.ok("decodeTrendPct" in a, "应提供纯解码口径的趋势");
 });
 
 // ── 端到端：CLI ─────────────────────────────────────────────────────────
@@ -698,7 +1138,58 @@ test("CLI --json: 是合法 JSON，且字段齐全", () => {
   assert.equal(data.samples[0].tokens, 400);
   assert.equal(data.samples[0].estimated, false);
   assert.equal(typeof data.stats.median, "number");
-  assert.equal(data.stats.trendPct, null, "单样本无法判断趋势");
+  assert.equal(data.stats.trendPct, undefined, "趋势不再放在 stats 里");
+  assert.equal(data.trendPct, null, "单样本无法判断趋势");
+});
+
+test("CLI --json: 带上分层指标与会话级事实", () => {
+  // 造够样本量，让每个 effort 分组都能过 n>=3 的阈值
+  const rounds = Array.from({ length: 4 }, (_, i) => ({ id: `m${i}`, ms: 2000, tokens: 400, chunks: 3 }));
+  const file = writeTranscript(rounds, { name: "json-insights.jsonl" });
+
+  patchUsage(file, {
+    input_tokens: 1000,
+    cache_read_input_tokens: 9000,
+    cache_creation_input_tokens: 0,
+  });
+  patchAssistant(file, { effort: "high" });
+  patchLines(file, (r) => {
+    if (r.type !== "assistant") return r;
+    r.message.model = "claude-opus-5";
+    r.message.stop_reason = "end_turn";
+    return r;
+  });
+
+  const data = JSON.parse(run("cc-watch.js", ["--json", "--history=5", file]));
+  const eff = data.breakdown.byEffort.find((g) => g.key === "high");
+  assert.ok(eff, "应按 effort 分组");
+  assert.equal(eff.count, 4);
+  assert.ok(eff.medianTtftMs != null, "分组里应带首字等待");
+  assert.equal(data.samples[0].cacheHitRatio, 0.9, "缓存命中率应被解析出来（9000/10000）");
+  assert.equal(data.sessionFacts.cache.sampleCount, 4);
+  assert.equal(data.sessionFacts.anomalies.maxTokens, 0);
+});
+
+test("CLI --insights: 输出分层对比与会话级事实，且无色码", () => {
+  const rounds = [];
+  for (let i = 0; i < 4; i++) rounds.push({ id: `hi_${i}`, ms: 1000, tokens: 400, chunks: 3 });
+  for (let i = 0; i < 4; i++) rounds.push({ id: `lo_${i}`, ms: 4000, tokens: 400, chunks: 3 });
+  const file = writeTranscript(rounds, { name: "insights.jsonl" });
+
+  patchLines(file, (r) => {
+    if (r.type !== "assistant") return r;
+    r.effort = r.message.id.startsWith("hi_") ? "low" : "xhigh";
+    r.message.usage = { ...r.message.usage, input_tokens: 1000, cache_read_input_tokens: 9000 };
+    return r;
+  });
+
+  const out = run("cc-watch.js", ["--insights", file]);
+  assert.match(out, /── 指标分层 ──/);
+  assert.match(out, /按 effort 档位/);
+  assert.match(out, /── 会话级事实 ──/);
+  assert.match(out, /缓存: /);
+  assert.match(out, /low /, "应出现 low 档分组");
+  assert.doesNotMatch(out, /\x1b\[/, "报告不应含 ANSI 色码");
 });
 
 test("CLI --once: 单行输出", () => {
@@ -801,7 +1292,28 @@ test("statusline: 有 transcript 时输出单行读数", () => {
   const out = run("cc-statusline.js", [], {
     input: JSON.stringify({ session_id: "sess-status", transcript_path: file }),
   });
-  assert.match(out, /⚡ \d+ tok\/s \(中位 \d+\)/);
+  assert.match(out, /⚡ \d+ tok\/s/, "应给出本轮速度");
+  assert.equal(out.trim().split("\n").length, 1, "状态栏必须是单行");
+});
+
+test("statusline: CC_TOOLKIT_STATUSLINE_FIELDS 控制显示哪些段", () => {
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }], { name: "sl-fields.jsonl" });
+  const input = JSON.stringify({ session_id: "sl-fields", transcript_path: file });
+
+  const only = run("cc-statusline.js", [], {
+    input,
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "tps" },
+  });
+  assert.match(only, /tok\/s/);
+  assert.doesNotMatch(only, /首字/, "未选中的字段不该出现");
+
+  const full = run("cc-statusline.js", [], {
+    input,
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "tps,ttft,decode,median" },
+  });
+  assert.match(full, /tok\/s/);
+  assert.match(full, /首字/);
+  assert.match(full, /解码/);
 });
 
 test("statusline: 空 stdin 与禁用开关都安全退出", () => {

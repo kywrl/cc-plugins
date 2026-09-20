@@ -71,6 +71,29 @@ if (!picked) {
         `${OK} 解析成功：${stats.count} 条样本，中位 ${stats.median.toFixed(0)} tok/s，` +
           `已解析 ${tracker.parsedLines} 行（失败 ${tracker.parseErrors} 行）`
       );
+      if (stats.medianDecodeTps != null) {
+        say(
+          `   拆分口径：${stats.decodeCount}/${stats.count} 条可算纯解码，` +
+            `中位 ${stats.medianDecodeTps.toFixed(0)} tok/s` +
+            (stats.medianTtftMs != null ? `，首字中位 ${(stats.medianTtftMs / 1000).toFixed(1)}s` : "")
+        );
+      } else {
+        say(`   ${WARN} 本会话没有可拆分的样本，纯解码速度暂时算不出来`);
+      }
+      const f = tracker.sessionFacts();
+      say(
+        `   缓存：${f.cache.sampleCount} 条可测` +
+          (f.cache.medianHitRatio != null ? `，中位命中 ${(f.cache.medianHitRatio * 100).toFixed(0)}%` : "")
+      );
+      if (f.thinking.detailCount === 0 && f.thinking.withBlock > 0) {
+        say(
+          `   ${WARN} usage 里没有 thinking_tokens 明细（该 provider / 版本不上报），` +
+            `thinking 占比会显示为空`
+        );
+      }
+      if (f.apiErrors.count) {
+        say(`${WARN} 本窗口内有 ${f.apiErrors.count} 次 API 错误（重试 ${f.apiErrors.retried} 次）`);
+      }
     } else {
       say(`${WARN} 能读到文件，但样本不足（低于 ${core.MIN_SAMPLE_TOKENS} tok 或 ${core.MIN_SAMPLE_MS}ms 的响应会被过滤）`);
     }
@@ -119,6 +142,9 @@ say("环境变量开关");
 say("────────────");
 say("  CC_TOOLKIT_DISABLE=1             临时关闭（hook 与状态栏都受控）");
 say("  CC_TOOLKIT_MIN_TOKENS=30         低于该 token 数的响应不报告");
+say("  CC_TOOLKIT_SHOW=tps,ttft,...     每轮那行包含哪些字段");
+say("  CC_TOOLKIT_ALERTS=0              关掉截断 / 低缓存 / 重试的附加提示");
+say("  CC_TOOLKIT_NOTIFY=1              偏慢时发桌面通知（OSC 777）");
 say("  CC_TOOLKIT_QUIET=1               只在明显偏慢时才提示");
 say("  CC_TOOLKIT_SLOW_TOKENS_PER_SEC=20  QUIET 模式的「慢」阈值");
 say("  CC_TOOLKIT_VERBOSE=1             把诊断信息写到 stderr");
