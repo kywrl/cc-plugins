@@ -1581,8 +1581,19 @@ test("doctor: 正常退出并打印检查项", () => {
  * 于是「命令跑一下就 MODULE_NOT_FOUND」能一路活到发布。
  */
 const PLUGIN_ROOT = path.join(__dirname, "..");
-/** 仓库根。plugin.json / marketplace.json 里的描述也面向用户，同样要检查 */
+/**
+ * 仓库根。plugin.json / marketplace.json 里的描述也面向用户，同样要检查。
+ *
+ * 这份测试文件也随插件分发，会被从安装缓存里跑（~/.claude/plugins/cache/.../<版本>/），
+ * 那里 PLUGIN_ROOT/../.. 是版本缓存目录而不是仓库根 —— 照扫会读到 1.0.1/1.1.0 这些
+ * 历史版本的文案，把一个正确的构建判成失败。所以只认真正有 plugins/cc-toolkit 的那层。
+ */
 const REPO_ROOT = path.join(PLUGIN_ROOT, "..", "..");
+const IN_REPO = fs.existsSync(path.join(REPO_ROOT, "plugins", "cc-toolkit"));
+if (!IN_REPO) {
+  // 从安装缓存跑：只检查插件自身，仓库根的 README / marketplace.json 不在身边
+  // （它们由仓库里的 CI / 发布流程负责，见 README「开发与测试」）。
+}
 
 /**
  * 递归收集文件，跳过运行时残留。
@@ -1649,10 +1660,15 @@ test("词表一致性: 文档与描述里不再出现已废弃的说法", () => 
 
   const files = [
     ...collectFiles(PLUGIN_ROOT, { includeDotDirs: true }),
-    ...collectFiles(REPO_ROOT, { includeDotDirs: true }).filter((f) =>
-      /(?:^|\/)(?:README|CHANGELOG)\.md$/.test(f) ||
-      /\.claude-plugin\/[^/]+\.json$/.test(f)
-    ),
+    // 仓库根的 README / marketplace.json 只有真正在仓库里时才在范围内；
+    // 从安装缓存跑时 REPO_ROOT 是版本缓存目录，扫它会读到历史版本。
+    ...(IN_REPO
+      ? collectFiles(REPO_ROOT, { includeDotDirs: true }).filter(
+          (f) =>
+            /(?:^|\/)(?:README|CHANGELOG)\.md$/.test(f) ||
+            /\.claude-plugin\/[^/]+\.json$/.test(f)
+        )
+      : []),
   ].filter(
     (f) =>
       /\.(md|json|js)$/.test(f) &&
@@ -1676,15 +1692,20 @@ test("词表一致性: 文档与描述里不再出现已废弃的说法", () => 
  * 状态栏字段表：README 列的名字必须与渲染器实际认的名字一致。
  * 上一次是 README 说「字段含义同 CC_TOOLKIT_SHOW」，实际只实现 5 个，
  * 用户照搬 tokens/model 只会得到一行空白。
+ *
+ * 仓库根 README 不随插件分发，从安装缓存跑时读不到 —— 那时退化成只校验
+ * 「渲染器实现了几个字段」，字段表对照留到仓库里跑。
  */
 test("词表一致性: README 的状态栏字段表与渲染器一致", () => {
-  const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
   const src = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "cc-statusline.js"), "utf8");
 
   // 渲染器实际认的字段：fields.has("x") 出现在渲染段里
   const implemented = new Set([...src.matchAll(/fields\.has\("([a-z]+)"\)/g)].map((m) => m[1]));
   assert.ok(implemented.size >= 5, `没解析出状态栏字段，正则需要更新：${[...implemented]}`);
 
+  if (!IN_REPO) return; // 不在仓库里就跳过字段表对照
+
+  const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
   // README 的状态栏字段列表：抓 `- \`name\` → ` 这种 bullet
   const section = readme.split("## 状态栏集成")[1] || "";
   const listed = new Set([...section.matchAll(/^- `([a-z]+)` → /gm)].map((m) => m[1]));
