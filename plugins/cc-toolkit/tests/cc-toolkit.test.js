@@ -123,6 +123,54 @@ function patchAssistant(file, extra) {
   return file;
 }
 
+/**
+ * 造一份「一轮里有多次 API 调用」的 transcript —— 真实 provider 的常态。
+ *
+ * 一次回复里模型可能调用几十上百次 API（每次一个 message.id），中间夹着工具执行。
+ * usage 只落在其中**少数** id 上，其余 id 的 output_tokens 是 0。
+ * 旧实现只读最后一个 id，会因此丢掉整轮读数（实测低估最多 365 倍）。
+ *
+ * @param {Array<{id:string, blocks:number, tokens?:number, ms:number}>} calls
+ *   按顺序的一次次 API 调用。tokens 省略或为 0 = 该次调用没有 usage。
+ * @param {{prompt:string, toolGapMs?:number, name?:string}} [opts]
+ *   toolGapMs：两次调用之间的工具执行时间（不应被算进解码速度）
+ */
+function writeMultiCallTurn(calls, { prompt = "prompt", toolGapMs = 0, name } = {}) {
+  const dir = fs.mkdtempSync(path.join(tmpRoot, "multi-"));
+  const file = path.join(dir, name || `multi-${Math.random().toString(36).slice(2)}.jsonl`);
+  const lines = [];
+  let t = Date.parse("2026-01-01T00:00:00Z");
+
+  lines.push(
+    JSON.stringify({ type: "user", timestamp: new Date(t).toISOString(), message: { role: "user", content: prompt } })
+  );
+
+  for (const c of calls) {
+    const blocks = c.blocks || 1;
+    const per = Math.max(1, Math.round(((c.tokens || 100) * 4) / blocks));
+    for (let i = 0; i < blocks; i++) {
+      t += Math.round(c.ms / Math.max(1, blocks));
+      lines.push(
+        JSON.stringify({
+          type: "assistant",
+          timestamp: new Date(t).toISOString(),
+          message: {
+            id: c.id,
+            role: "assistant",
+            content: [{ type: "text", text: "x".repeat(per) }],
+            // usage 累计式：只有带 tokens 的那次调用有值，且是总数
+            usage: c.tokens ? { output_tokens: c.tokens } : { output_tokens: 0 },
+          },
+        })
+      );
+    }
+    t += toolGapMs; // 工具执行时间：两次 API 调用之间的空隙
+  }
+
+  fs.writeFileSync(file, lines.join("\n") + "\n", "utf8");
+  return file;
+}
+
 // ── 单元测试 ────────────────────────────────────────────────────────────
 
 test("estimateTokens: CJK 按 1.5 字符/token，拉丁按 4 字符/token", () => {
@@ -146,6 +194,121 @@ test("median / percentile: 奇偶长度都正确", () => {
   assert.equal(core.median([1, 2, 3, 4]), 2.5);
   assert.equal(core.percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90), 9);
 });
+
+test("SessionTracker: 一轮里多次 API 调用被聚合成一个整体", () => {
+  // 回归测试：真实 provider 一轮回复里有几十上百次 API 调用，usage 只落在
+  // 少数 id 上。旧实现只读最后一个 message.id，最后一个常常是
+  // output_tokens: 0 的哨兵行 —— 整轮读数直接归零。
+  const file = writeMultiCallTurn([
+    { id: "c1", blocks: 2, tokens: 300, ms: 1000 },
+    { id: "c2", blocks: 2, tokens: 0, ms: 1000 }, // 无 usage
+    { id: "c3", blocks: 2, tokens: 0, ms: 1000 }, // 无 usage，末次调用
+  ]);
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+
+  assert.equal(r.calls, 3, "三次 API 调用属于同一轮");
+  assert.ok(r.tokens >= 300, "tokens 应是整轮聚合，不是最后一个 id 的 0");
+  assert.ok(r.cache === null, "没有缓存字段时如实返回 null");
+  assert.ok(r.ttftMs != null, "首字以真人输入为锚，恒可算");
+});
+
+test("SessionTracker: 聚合解码跨度时逐次测量，不把工具执行时间算进去", () => {
+  // 关键陷阱：一轮里两次 API 调用之间夹着工具执行（这里 10s）。
+  // 若用「整轮首块→末块」当分母，这段工具等待会被当成解码时间，
+  // 读数被严重低估（实测从 128 压到 10 tok/s）。
+  const file = writeMultiCallTurn(
+    [
+      { id: "c1", blocks: 2, tokens: 400, ms: 1000 }, // 内部跨度 ~500ms
+      { id: "c2", blocks: 2, tokens: 400, ms: 1000 }, // 内部跨度 ~500ms
+    ],
+    { toolGapMs: 10000 }
+  );
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+
+  // 只有 1000ms 的两段内部跨度可计入，10s 的工具等待不算
+  assert.ok(r.decodeMs < 3000, `解码跨度应排除工具间隙，实际 ${r.decodeMs}ms`);
+  assert.ok(r.durMs > 10000, "但整轮耗时如实包含工具执行时间");
+  assert.ok(r.decodeTps > 200, `解码速度不该被工具等待拖低，实际 ${Math.round(r.decodeTps)}`);
+  assert.ok(r.tps < r.decodeTps, "含工具时间的整轮速度必然更低");
+});
+
+test("SessionTracker: usage 只落在部分调用上时，tokens 混合求和", () => {
+  // 有 usage 的用精确值，没有的用字符估算 —— 只求和有 usage 的那些
+  // 会把 tokens 严重低估（实测最多 365 倍）。
+  const file = writeMultiCallTurn([
+    { id: "c1", blocks: 2, tokens: 1000, ms: 1000 },
+    { id: "c2", blocks: 2, tokens: 0, ms: 1000 },
+  ]);
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+
+  assert.ok(r.tokens > 1000, "无 usage 的那次调用也要计入（靠字符估算），而不是被丢掉");
+  assert.equal(r.estimatedFields.decode, true, "decode 用到了估算值 → 该字段要标 ≈");
+});
+
+test("SessionTracker: 缓存命中率按整轮聚合，任一调用带上即可算", () => {
+  const dir = fs.mkdtempSync(path.join(tmpRoot, "turncache-"));
+  const file = path.join(dir, "tc.jsonl");
+  const t0 = Date.parse("2026-01-01T00:00:00Z");
+  const line = (ms, id, usage) =>
+    JSON.stringify({
+      type: "assistant",
+      timestamp: new Date(t0 + ms).toISOString(),
+      message: { id, role: "assistant", content: [{ type: "text", text: "x".repeat(40) }], usage },
+    }) + "\n";
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ type: "user", timestamp: new Date(t0).toISOString(), message: { role: "user", content: "p" } }) +
+      "\n" +
+      line(500, "c1", { output_tokens: 0 }) + // 末次调用没有 usage
+      line(1000, "c2", { output_tokens: 100, input_tokens: 1000, cache_read_input_tokens: 9000 }),
+    "utf8"
+  );
+
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+  assert.ok(r.cache, "缓存取整轮里最有信息量的那次调用");
+  assert.equal(r.cache.hitRatio, 0.9, "9000 / (9000+0+1000)");
+});
+
+test("SessionTracker: 工具结果与技能注入不作为轮次锚点", () => {
+  // user 行有三种：真人输入(字符串)、tool_result、isMeta 注入。
+  // 后两种都不是「新的一轮」，拿它们当锚点会把一轮越切越碎。
+  const dir = fs.mkdtempSync(path.join(tmpRoot, "anchorjs-"));
+  const file = path.join(dir, "aj.jsonl");
+  const t0 = Date.parse("2026-01-01T00:00:00Z");
+  const rows = [
+    JSON.stringify({ type: "user", timestamp: new Date(t0).toISOString(), message: { role: "user", content: "真的问题" } }),
+    // 工具结果回流：不是新一轮
+    JSON.stringify({
+      type: "user",
+      timestamp: new Date(t0 + 1000).toISOString(),
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+    }),
+    // 技能注入：isMeta=true，不是新一轮
+    JSON.stringify({
+      type: "user",
+      isMeta: true,
+      timestamp: new Date(t0 + 1500).toISOString(),
+      message: { role: "user", content: [{ type: "text", text: "Base directory for this skill: /tmp" }] },
+    }),
+    JSON.stringify({
+      type: "assistant",
+      timestamp: new Date(t0 + 2000).toISOString(),
+      message: { id: "a1", role: "assistant", content: [{ type: "text", text: "x".repeat(400) }], usage: { output_tokens: 100 } },
+    }),
+    JSON.stringify({
+      type: "assistant",
+      timestamp: new Date(t0 + 3000).toISOString(),
+      message: { id: "a2", role: "assistant", content: [{ type: "text", text: "y".repeat(400) }], usage: { output_tokens: 100 } },
+    }),
+  ];
+  fs.writeFileSync(file, rows.join("\n") + "\n", "utf8");
+
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+  assert.equal(r.calls, 2, "两次 API 调用都在同一轮里（没被 tool_result 切开）");
+  // 锚点仍是 t0 那个真人输入 → 首字 2000ms，而不是 1000ms 或 500ms
+  assert.equal(r.ttftMs, 2000, "锚点应是最初的真人输入，不是 tool_result / isMeta 行");
+});
+
 
 test("SessionTracker: 用 usage 精确值计算 tok/s", () => {
   // 一轮：400 token，耗时 2000ms → 200 tok/s
@@ -429,8 +592,9 @@ test("hook: 「每秒输出」用纯解码口径，扣掉首字等待", () => {
   assert.doesNotMatch(msg, /每秒输出 167 tok\/s/, "整轮口径会重复计入首字等待");
 });
 
-test("hook: 测不出纯解码时省略该段，不拿整轮速度冒充", () => {
-  // 单块回复：首块即末块，decodeTps 测不出来
+test("hook: 测不出纯解码时显示 — 占位，不拿整轮速度冒充", () => {
+  // 单块回复：首块即末块，decodeTps 测不出来。
+  // 三格位置固定 —— 测不出的那格显示 —，而不是整段消失。
   const file = patchUsage(
     writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 1 }], { name: "singleblock-session.jsonl" }),
     { input_tokens: 80, cache_read_input_tokens: 920 }
@@ -439,8 +603,11 @@ test("hook: 测不出纯解码时省略该段，不拿整轮速度冒充", () =>
     input: JSON.stringify({ session_id: "single", transcript_path: file }),
   });
   const msg = JSON.parse(out).systemMessage;
-  assert.doesNotMatch(msg, /每秒输出/, "拆不出来就不该报，而不是退回含 prefill 的数");
+  assert.match(msg, /每秒输出 —/, "拆不出来就占位，而不是退回含 prefill 的数");
+  assert.doesNotMatch(msg, /每秒输出 \d/, "不该有假的解码速度");
   assert.match(msg, /缓存命中 92%/, "其余字段照常");
+  assert.match(msg, /首字 [\d.]+s/, "首字照常");
+  assert.equal(msg.split(" | ").length, 3, "三格位置固定，缺一不可");
 });
 
 test("hook: CC_TOOLKIT_SHOW 能裁剪输出行", () => {
@@ -605,7 +772,7 @@ test("SessionTracker: 块被一次性写盘时不报解码速度", () => {
 
   const r = new core.SessionTracker(file).start().latestRound({ force: true });
   assert.equal(r.blocks, 3);
-  assert.equal(r.decodeMs, 2, "跨度只有 2ms");
+  assert.equal(r.decodeMs, null, "跨度只有 2ms，没有可计入的可测区间");
   assert.equal(r.decodeTps, null, "跨度太短 → 不报解码速度");
   assert.equal(r.decodeReason, "not-measurable");
   assert.ok(r.tps < 1000, "整轮口径不会被这种轮次污染");
@@ -655,7 +822,11 @@ test("SessionTracker: 回放窗口切断起点锚时，首字与整轮速度都�
   assert.equal(r.ttftMs, null, "锚点没见到就不该报 0 —— 那会被渲染成「首字 0.0s」");
   assert.equal(r.ttftMeaningful, false, "测不出来的首字不该展示");
   assert.equal(r.truncatedAnchor, true, "要标出这一轮的锚点被窗口切掉了");
-  assert.ok(r.tps > 100, "整轮速度确实会因缺失锚点而偏高（这正是它不能进聚合的原因）");
+  // 锚点是整轮耗时与首字的分母。锚点没了，这两个数就都失去意义 ——
+  // 旧的实现会用首个内容块兜底 start，得出一个系统性偏高的 tps；
+  // 现在干脆不给数（durMs=0 → tps=0），由渲染层显示 —。
+  assert.equal(r.durMs, 0, "没有锚点就没有可信的整轮耗时");
+  assert.equal(r.tps, 0, "宁可不报，也不报一个系统性偏高的速度");
 
   // 对照：完整读到用户行时一切正常
   const ok = new core.SessionTracker(file).start({ replayTailBytes: 1e9 }).latestRound({ force: true });
@@ -1041,7 +1212,8 @@ test("hook: 收到事件后输出 {systemMessage}，且不含 extra 字段", () 
   const payload = JSON.parse(out);
   // Stop hook 是控制类 hook，不接受 decision/continue，只回 systemMessage 最安全
   assert.equal(Object.keys(payload).length, 1);
-  assert.match(payload.systemMessage, /^首字 [\d.]+s \| 每秒输出 \d+ tok\/s$/);
+  // 三格位置固定：这份夹具没有缓存字段，末格显示 — 而不是消失
+  assert.match(payload.systemMessage, /^首字 [\d.]+s \| 每秒输出 \d+ tok\/s \| 缓存命中 —$/);
 });
 
 test("hook: stop_hook_active 时静默，防止递归", () => {
@@ -1207,6 +1379,17 @@ test("词表一致性: 文档与描述里不再出现已废弃的说法", () => 
     {
       re: /CC_TOOLKIT_STATUSLINE_/,
       why: "2.1.0 移除了状态栏，这三个环境变量不再被任何脚本读取",
+    },
+    // 2.2.0 把「一轮」的定义从「一次 API 调用」改成「你发一条消息 → 回复结束」。
+    // 旧文案把 decode 描述成「首块 → 末块」的连续区间 —— 那个口径在聚合整轮时
+    // 会把工具执行时间算成解码时间（实测读数被压低近十倍），不能再用。
+    {
+      re: /首个内容块\s*→\s*最后一个内容块/,
+      why: "2.2.0 起 decode 按各次 API 调用内部跨度求和，不是整轮首块→末块",
+    },
+    {
+      re: /首末内容块间隔|首末块间隔/,
+      why: "2.2.0 起 decode 的判据是「各次调用跨度之和」，不是整轮首末块间隔",
     },
   ];
 

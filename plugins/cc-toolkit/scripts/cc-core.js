@@ -22,21 +22,31 @@
  *   · decode（写回答）  —— 首块到最后一块之间。
  * 合成一个数字时，prompt 越长读数越低，会被误读成「模型变慢」。所以拆开：
  *
- *   ttftMs     上一条记录 → 本轮首个块的间隔（≈ 首字等待，含 prefill +
+ *   ttftMs     真人输入 → 本轮首个块的间隔（≈ 首字等待，含 prefill +
  *              排队 + 首个 thinking/text 块的生成时间）
- *   decodeTps  首块 → 最后一块之间的速度。这是唯一不含 prefill 的纯解码读数。
- *              需要 ≥2 个内容块；本机实测 70.2% 的响应满足（只有一段输出的
- *              单块回复无法拆分，此时 decodeTps 为 null，只能退回整轮 tps）。
- *   tps        整轮 tokens ÷ 整轮耗时。与旧版本口径一致，保证可比性。
+ *   decodeTps  纯解码速度。一轮回复里可能有几十上百次 API 调用，每次都单独
+ *              测「首块 → 末块」的跨度再求和 —— 调用之间夹着的工具执行时间
+ *              不属于解码，算进去会把读数压低近十倍（实测 128 → 10 tok/s）。
+ *              没有任何一次调用有可测跨度时返回 null，由调用方显示占位符。
+ *   tps        整轮 tokens ÷ 整轮耗时（含 prefill 与工具执行），保证可比性。
  *
  * 注意 decodeTps 与 tps 不是同一个量：单块回复里 thinking 块可能占了大头，
  * 整轮 tps 因此偏低。两者都报，让读数自己说明问题。
+ *
+ * ── 「一轮」有两个口径，各有各的用处 ──────────────────────────────────
+ *   · 每轮读数（hook）：你发一条消息 → 回复结束。中间的所有 API 调用聚合
+ *     成一个整体（见 _openTurn / _describeTurn）。
+ *   · 统计样本（/cc-toolkit:tps）：一次 API 调用（见 groups / _archive）。
+ *     这个粒度能自然地剔掉工具执行时间，让历史样本之间可比。
+ * 两者口径不同是**有意**的，不是不一致。
  *
  * ── 第三方 provider 的两个坑（实测）────────────────────────────────────
  *   · usage 是「累计式」：同一 message 的多个块只有末尾若干块带 usage，
  *     且带的是同一个总数（0,0,1573,1573）。必须取 max，且 decode 的终点
  *     要用「最后一个内容块」而不是「带 usage 的那块」。
- *   · 62% 的块 output_tokens 为 0，且没有 thinking_tokens 明细。
+ *   · 62% 的块 output_tokens 为 0，且没有 thinking_tokens 明细。更关键的是
+ *     usage 只落在**少数 message.id** 上 —— 一轮里可能有 172 个 id，只有几个
+ *     带 usage。只读单个 id 会把整轮 tokens 低估最多 365 倍（实测）。
  */
 
 const fs = require("fs");
@@ -92,6 +102,23 @@ function percentile(values, p) {
   const sorted = [...values].sort((a, b) => a - b);
   const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
   return sorted[idx];
+}
+
+/**
+ * 这一行 user 记录是不是「用户真的敲了回车」。
+ *
+ * 会话文件里 user 行有三种，只有第一种是真人输入：
+ *   · content 是字符串            —— 真人敲的提示词
+ *   · content 是数组含 tool_result —— 工具结果回流，属于上一轮的内部过程
+ *   · content 是数组含 text 且 isMeta —— 技能/系统注入（实测 isMeta=true）
+ * 后两种都不是新的一轮，拿它们当轮次锚点会把一轮越切越碎。
+ */
+function isHumanInput(record) {
+  if (!record || record.type !== "user" || record.isMeta) return false;
+  const c = record.message && record.message.content;
+  if (typeof c === "string") return true;
+  if (Array.isArray(c)) return c.length > 0 && !c.some((b) => b && b.type === "tool_result");
+  return false;
 }
 
 /**
@@ -230,6 +257,13 @@ class SessionTracker {
     this.lastEventAt = 0; // 最后一次块落盘的本地时间，用于判断是否仍在流式
     this.parsedLines = 0;
     this.parseErrors = 0;
+    // ── 用户视角的一轮（「我发一条消息 → 回复结束」）──
+    // groups 按 message.id 切分，是「一次 API 调用」的粒度；但一轮回复里可能有
+    // 几十上百次调用（实测最多 172 个 id），usage 只落在其中少数 id 上。
+    // 只读最后一个 id 会把整轮读数丢掉（实测低估 tokens 最多 365 倍）。
+    // turn 把这之间的所有调用聚合成一个整体，供 hook 使用。
+    this.turn = null; // 见 _openTurn / _describeTurn
+    this.lastTurn = null; // 最新一个已归档的轮次读数
     // ── 会话级事件（都来自 system / user 行的旁路信息）──
     this.turnDurations = []; // CLI 自报的整轮耗时（system/turn_duration）
     this.apiErrors = []; // 重试 / 断连记录（system/api_error）
@@ -321,6 +355,209 @@ class SessionTracker {
     }
     if (!g.serviceTier && usage.service_tier) g.serviceTier = usage.service_tier;
     if (!g.speed && usage.speed) g.speed = usage.speed;
+  }
+
+  // ── 用户视角的一轮：把一次回复里的所有 API 调用聚合成一个整体 ──────────
+
+  /**
+   * 开一轮新的（用户发了消息）。
+   * @param {number|null} startTs 真人输入那一刻，作为 TTFT 与整轮耗时的锚点
+   */
+  _openTurn(startTs) {
+    if (this.turn) this._archiveTurn();
+    this.turn = {
+      start: startTs,
+      byId: new Map(), // message.id -> 该次 API 调用的累计量
+      order: [], // 保持出现顺序
+      blocks: 0,
+      blockTypes: {},
+      firstBlockAt: null,
+      lastBlockAt: null,
+      model: null,
+      effort: null,
+      stopReason: null,
+      slug: null,
+      skill: null,
+      mcp: null,
+      mcpTool: null,
+      plugin: null,
+    };
+  }
+
+  /** 本轮里某次 API 调用的累计器 */
+  _turnCall(id) {
+    if (!this.turn) this._openTurn(null);
+    let c = this.turn.byId.get(id);
+    if (!c) {
+      c = {
+        id,
+        ts: [], // 该次调用的块落盘时刻（用于算它自己的 decode 跨度）
+        out: 0, // usage 里的精确输出 token
+        est: 0, // 无 usage 时由字符数估算
+        hasUsage: false,
+        thinking: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        fresh: 0,
+        cache5m: 0,
+        cache1h: 0,
+        blocks: 0,
+      };
+      this.turn.byId.set(id, c);
+      this.turn.order.push(id);
+    }
+    return c;
+  }
+
+  /**
+   * 把一个轮次的原始累积量折算成读数。
+   *
+   * 三个读数各自独立地「能算就算，算不出返回 null」—— 调用方据此显示 —，
+   * 而不是因为一个算不出来就整行省略。
+   */
+  _describeTurn(t) {
+    if (!t) return null;
+
+    let tokens = 0;
+    let estimated = false; // 整轮口径：有任何一个数字来自字符估算
+    let estTtft = false;
+    let estDecode = false;
+    let estCache = false;
+    let thinkingTokens = 0; // 取各次调用的 max（thinking 是 output 的子集，累计会重复）
+
+    let measurableMs = 0; // 可测的 decode 跨度之和
+    let measurableTokens = 0; // 只与 measurableMs 同源
+    let cacheRead = 0;
+    let cacheWrite = 0;
+    let fresh = 0;
+    let cache5m = 0;
+    let cache1h = 0;
+
+    for (const id of t.order) {
+      const c = t.byId.get(id);
+      const callTokens = c.hasUsage ? c.out : c.est;
+      tokens += callTokens;
+      if (!c.hasUsage && c.est > 0) estimated = true;
+      if (c.thinking > thinkingTokens) thinkingTokens = c.thinking;
+
+      // 这一次调用自身的 decode 跨度。单块 / 块被一次性写盘 → 跨度为 0，
+      // 没有可测区间，这一次调用的时间与 token 都不参与 decode 计算。
+      const span = c.ts.length >= 2 ? Math.max(...c.ts) - Math.min(...c.ts) : 0;
+      if (span >= MIN_DECODE_MS && callTokens > 0) {
+        measurableMs += span;
+        measurableTokens += callTokens;
+        if (!c.hasUsage) estDecode = true; // 只有走了估算才影响 decode 的精度
+      }
+
+      // 缓存取本轮里最有信息量的那次调用（读+写+新 之和最大）
+      if (c.hasUsage && c.cacheRead + c.cacheWrite + c.fresh > cacheRead + cacheWrite + fresh) {
+        cacheRead = c.cacheRead;
+        cacheWrite = c.cacheWrite;
+        fresh = c.fresh;
+        cache5m = c.cache5m;
+        cache1h = c.cache1h;
+      }
+    }
+
+    // 首字：真人输入 → 本轮第一个内容块。锚点在就是可算的（与用户判断一致）。
+    let ttftMs = null;
+    if (t.start != null && t.firstBlockAt != null) {
+      const gap = t.firstBlockAt - t.start;
+      if (gap >= 0 && gap < MAX_PLAUSIBLE_TTFT_MS) ttftMs = gap;
+    }
+
+    const cacheTotal = cacheRead + cacheWrite + fresh;
+    const cache = cacheTotal > 0
+      ? {
+          read: cacheRead,
+          write: cacheWrite,
+          fresh,
+          hitRatio: cacheRead / cacheTotal,
+          ephemeral5m: cache5m,
+          ephemeral1h: cache1h,
+        }
+      : null;
+
+    // decode：只有累加跨度够长才算得出来，否则 null（调用方显示 —）
+    const decodeTps =
+      measurableMs >= MIN_DECODE_MS && measurableTokens > 0
+        ? measurableTokens / (measurableMs / 1000)
+        : null;
+
+    // 整轮耗时：真人输入 → 最后一个内容块（含中途的工具执行时间）。
+    // 只用于展示「这一轮等了多久」，不参与 decode 计算。
+    const durMs = t.start != null && t.lastBlockAt != null ? Math.max(0, t.lastBlockAt - t.start) : 0;
+    const tps = durMs > 0 ? tokens / (durMs / 1000) : 0;
+
+    // thinking 占比：think 可能略大于 out（实测 7/29509 行如此），clamp 一下
+    const think = Math.min(thinkingTokens, tokens);
+
+    return {
+      tokens,
+      estimated,
+      estimatedFields: { ttft: estTtft, decode: estDecode, cache: estCache },
+      // partial：这一轮已经结束，但 usage 没落盘，token 数只能靠字符估
+      partial: estimated,
+      durMs,
+      tps,
+      ttftMs,
+      // 首块之后还有多少时间 —— 太短说明「首字」和「整轮」几乎同一个数，
+      // 一起显示只是重复（单块回复时二者完全相等），看起来像算错了。
+      // 与 decode 用同一个下限，保持一致。
+      ttftMeaningful: ttftMs != null && durMs - ttftMs > MIN_DECODE_MS,
+      decodeMs: measurableMs > 0 ? measurableMs : null,
+      decodeTps,
+      decodeReason:
+        decodeTps != null
+          ? null
+          : t.blocks < 2
+            ? "single-block"
+            : measurableMs < MIN_DECODE_MS
+              ? "not-measurable"
+              : "no-usage",
+      // 回放窗口从文件中途开始时，本轮的用户行可能已被切掉 —— 锚点没见过，
+      // 首字与整轮耗时都少了一整段，不能当作正常样本。
+      truncatedAnchor: t.start == null,
+      thinkingTokens: think,
+      thinkingShare: tokens > 0 && think ? think / tokens : null,
+      cache,
+      blocks: t.blocks,
+      blockTypes: t.blockTypes,
+      calls: t.order.length,
+      measurableCalls: t.order.filter((id) => {
+        const c = t.byId.get(id);
+        return c.ts.length >= 2 && Math.max(...c.ts) - Math.min(...c.ts) >= MIN_DECODE_MS;
+      }).length,
+      hasToolUse: (t.blockTypes.tool_use || 0) > 0,
+      model: t.model,
+      effort: t.effort,
+      stopReason: t.stopReason,
+      stoppedByLimit: t.stopReason === "max_tokens",
+      refused: t.stopReason === "refusal",
+      slug: t.slug,
+      skill: t.skill,
+      mcp: t.mcp,
+      mcpTool: t.mcpTool,
+      plugin: t.plugin,
+      start: t.start,
+      at: t.lastBlockAt,
+    };
+  }
+
+  /** 归档当前轮（用户又发了消息，或显式收尾） */
+  _archiveTurn() {
+    const t = this.turn;
+    if (!t) return null;
+    this.turn = null;
+    const round = this._describeTurn(t);
+    if (round) this.lastTurn = round;
+    return round;
+  }
+
+  /** 当前这一轮（还没被归档的那个）的读数 */
+  currentTurn() {
+    if (!this.turn) return this.lastTurn || null;
+    return this._describeTurn(this.turn);
   }
 
   _archive(id) {
@@ -438,26 +675,42 @@ class SessionTracker {
   }
 
   /**
-   * 最新一轮的读数 —— **不套用统计过滤器**。
+   * 最新一轮的读数 —— **不套用统计过滤器**，且是**用户视角的一轮**。
    *
-   * 这是 hook 与状态栏该用的接口。统计过滤（MIN_SAMPLE_TOKENS / MIN_SAMPLE_MS）
-   * 只服务于中位数、p90 这类聚合，不该决定「本轮速度能不能显示」——
-   * 否则一条 46 token 的短回复会被 50 的阈值吃掉，用户设的
-   * CC_TOOLKIT_MIN_TOKENS 就形同虚设。
+   * 这是 hook 该用的接口。两个关键点：
+   *
+   * 1. 不套统计过滤（MIN_SAMPLE_TOKENS / MIN_SAMPLE_MS）。那些阈值只服务于
+   *    中位数、p90 这类聚合，不该决定「本轮速度能不能显示」—— 否则一条
+   *    46 token 的短回复会被 50 的阈值吃掉，用户设的 CC_TOOLKIT_MIN_TOKENS
+   *    就形同虚设。
+   *
+   * 2. 把「你发出一条消息 → 回复结束」之间的所有 API 调用聚合成一轮。
+   *    一轮回复里可能有几十上百次调用（实测最多 172 个 message.id），
+   *    而 usage 只落在其中少数 id 上 —— 只读最后一个 id 会把整轮读数丢掉
+   *    （实测低估 tokens 最多 365 倍）。
+   *
+   * 各字段能算就算，算不出返回 null，由调用方决定怎么展示 —— 不要因为
+   * 其中一个算不出来就把整条读数作废。
    *
    * @param {{force?: boolean, now?: number}} [opts]
-   *   force=true 表示「调用方确信本轮已结束」（Stop 事件就是这种信号），
-   *   此时不再等 3 秒的流式窗口。
-   * @returns {{tokens:number, estimated:boolean, durMs:number, tps:number, at:number, start:number}|null}
+   *   force=true 表示「调用方确信本轮已结束」（Stop 事件就是这种信号）。
+   *   注意：轮次边界由真人输入决定，与流式窗口无关，所以这里 force 只影响
+   *   是否回退到上一轮，不影响当前轮的折算。
+   * @returns {object|null}
    */
   latestRound({ force = false, now = Date.now() } = {}) {
-    const g = this.currentGroup();
-    if (g && (force || now - g.end >= STREAMING_WINDOW_MS)) {
-      const round = this._describe(g, { force: true, now });
-      // 至少要有一个 token 和正的耗时，否则除零 / 无意义
-      if (round.tokens >= 1 && round.durMs > 0) return round;
+    // 本轮已有内容就直接给本轮的读数
+    if (this.turn && this.turn.blocks > 0) {
+      const round = this._describeTurn(this.turn);
+      if (round && round.tokens >= 1) return round;
     }
-    return this.lastRound || null;
+    // 还没有任何 assistant 块落盘时，退回上一轮（否则 hook 会读到空）
+    return this.lastTurn || null;
+  }
+
+  /** 收尾当前轮，让它成为 lastTurn（Stop 事件时用） */
+  finalizeTurn() {
+    return this._archiveTurn();
   }
 
   /**
@@ -548,11 +801,14 @@ class SessionTracker {
       }
     }
 
-    if (record.type === "user" && ts) {
-      // TTFT 的锚点：用户按下回车那一刻。用上一条 user 行而不是上一条任意记录，
-      // 因为 assistant 块之间夹着的 tool_result / attachment 会把锚点推后。
-      if (this.lastUserTs == null || ts > this.lastUserTs) this.lastUserTs = ts;
-      if (this.lastTs == null || ts > this.lastTs) this.lastTs = ts;
+    if (record.type === "user") {
+      // 真人输入 = 新的一轮开始。锚点用「你按下回车那一刻」，
+      // tool_result / 技能注入（isMeta）都不是新一轮，不能拿来切开轮次。
+      if (isHumanInput(record) && ts) this._openTurn(ts);
+      if (ts) {
+        if (this.lastUserTs == null || ts > this.lastUserTs) this.lastUserTs = ts;
+        if (this.lastTs == null || ts > this.lastTs) this.lastTs = ts;
+      }
       return;
     }
 
@@ -612,6 +868,48 @@ class SessionTracker {
       if (record.attributionMcpServer) g.mcp = record.attributionMcpServer;
       if (record.attributionMcpTool) g.mcpTool = record.attributionMcpTool;
       if (record.attributionPlugin) g.plugin = record.attributionPlugin;
+
+      // ── 同一份数据也喂给「用户视角的一轮」 ──
+      // usage 只落在少数 id 上，所以按调用分别记账，聚合时再区分
+      // 「有精确值」与「只有估算」两类。
+      if (!this.turn) this._openTurn(this.lastTs ?? null); // 回放窗口从中间开始时兜底
+      const turn = this.turn;
+      const call = this._turnCall(id);
+      const u = record.message.usage || {};
+      const outTok = u.output_tokens || 0;
+      if (outTok > 0) {
+        call.hasUsage = true;
+        call.out = Math.max(call.out, outTok);
+        call.cacheRead = Math.max(call.cacheRead, u.cache_read_input_tokens || 0);
+        call.cacheWrite = Math.max(call.cacheWrite, u.cache_creation_input_tokens || 0);
+        call.fresh = Math.max(call.fresh, u.input_tokens || 0);
+        const cc = u.cache_creation || {};
+        call.cache5m = Math.max(call.cache5m, cc.ephemeral_5m_input_tokens || 0);
+        call.cache1h = Math.max(call.cache1h, cc.ephemeral_1h_input_tokens || 0);
+        const think = (u.output_tokens_details && u.output_tokens_details.thinking_tokens) || 0;
+        call.thinking = Math.max(call.thinking, think);
+      }
+      for (const block of record.message.content || []) {
+        call.blocks++;
+        turn.blocks++;
+        const bt = block.type || "unknown";
+        turn.blockTypes[bt] = (turn.blockTypes[bt] || 0) + 1;
+        if (bt === "text") call.est += estimateTokens(block.text || "");
+        else if (bt === "thinking") call.est += estimateTokens(block.thinking || "");
+      }
+      if (ts) {
+        call.ts.push(ts);
+        if (turn.firstBlockAt == null) turn.firstBlockAt = ts;
+        turn.lastBlockAt = ts;
+      }
+      if (record.message.model) turn.model = record.message.model;
+      if (record.effort) turn.effort = record.effort;
+      if (record.message.stop_reason) turn.stopReason = record.message.stop_reason;
+      if (record.slug) turn.slug = record.slug;
+      if (record.attributionSkill) turn.skill = record.attributionSkill;
+      if (record.attributionMcpServer) turn.mcp = record.attributionMcpServer;
+      if (record.attributionMcpTool) turn.mcpTool = record.attributionMcpTool;
+      if (record.attributionPlugin) turn.plugin = record.attributionPlugin;
 
       this.lastEventAt = Date.now();
     }

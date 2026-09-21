@@ -46,27 +46,50 @@ const silent = (reason) => {
  * 把本轮读数拼成一行。
  *
  * 三个字段对应三个正交的事实：等多久、生成多快、prompt 缓存有没有生效。
- * 「每秒输出」用 decodeTps（首块 → 末块）而不是整轮 tps —— 后者含 prefill，
- * 和「首字」两段会重复计入同一段时间。块被一次性写盘时 decodeTps 测不出来，
- * 这一段就整条省略，不拿含 prefill 的整轮速度冒充。
+ * 「每秒输出」用 decodeTps（各次 API 调用内部的跨度之和）而不是整轮 tps ——
+ * 后者含 prefill 与中途的工具执行时间，和「首字」两段会重复计入同一段时间。
+ *
+ * 三格**位置固定**：算不出来的那个显示 —，而不是整段消失。
+ * 缺一段会让「这一行有几个数」在每轮之间跳变，读者得先数一遍才知道少了什么；
+ * 固定三格则一眼能看出「哪个数没测到」。
  */
 function composeMessage(round, rollup, opts) {
   const { show } = opts;
-  const mark = round.estimated ? "≈" : "";
+  // 估算标记按字段独立判断：哪个数字来自字符估算，就在哪个前面加 ≈。
+  // 整行共用一个标记会让人误以为三个数都是估的。
+  const f = round.estimatedFields || {};
+  const mark = (key) => (f[key] ? "≈" : "");
   const bits = [];
 
-  if (show.has("ttft") && round.ttftMeaningful) {
-    bits.push(`首字 ${(round.ttftMs / 1000).toFixed(1)}s`);
+  if (show.has("ttft")) {
+    bits.push(
+      round.ttftMs != null ? `首字 ${mark("ttft")}${(round.ttftMs / 1000).toFixed(1)}s` : "首字 —"
+    );
   }
-  // decodeTps 的分母已经在 core 里扣掉首字等待，这个数就是纯生成速度
-  if (show.has("decode") && round.decodeTps > 0) {
-    bits.push(`每秒输出 ${mark}${Math.round(round.decodeTps)} tok/s`);
+  // decodeTps 已有可测区间时才报；测不出就诚实占位，不拿含 prefill / 工具时间的数冒充
+  if (show.has("decode")) {
+    bits.push(
+      round.decodeTps > 0
+        ? `每秒输出 ${mark("decode")}${Math.round(round.decodeTps)} tok/s`
+        : "每秒输出 —"
+    );
   }
-  if (show.has("cache") && round.cache) bits.push(`缓存命中 ${(round.cache.hitRatio * 100).toFixed(0)}%`);
+  if (show.has("cache")) {
+    bits.push(
+      round.cache
+        ? `缓存命中 ${mark("cache")}${(round.cache.hitRatio * 100).toFixed(0)}%`
+        : "缓存命中 —"
+    );
+  }
 
-  // 以下字段默认关着，只有用户显式加进 CC_TOOLKIT_SHOW 才出现
-  if (show.has("tps")) bits.push(`整轮 ${mark}${round.tps.toFixed(0)} tok/s`);
-  if (show.has("tokens")) bits.push(`${mark}${core.formatTokens(round.tokens)} tok`);
+  // 以下字段默认关着，只有用户显式加进 CC_TOOLKIT_SHOW 才出现。
+  // 同样遵循「算不出就占位」：锚点被切掉时整轮耗时无意义，显示 — 而不是 0。
+  if (show.has("tps")) {
+    bits.push(round.durMs > 0 ? `整轮 ${mark("ttft")}${round.tps.toFixed(0)} tok/s` : "整轮 —");
+  }
+  if (show.has("tokens")) {
+    bits.push(`${mark("decode")}${core.formatTokens(round.tokens)} tok`);
+  }
   if (show.has("tps") || show.has("tokens")) {
     bits[bits.length - 1] += ` / ${(round.durMs / 1000).toFixed(1)}s`;
   }
@@ -84,6 +107,23 @@ function composeMessage(round, rollup, opts) {
     msg += `${msg ? " | " : ""}近${rollup.count}条中位 ${med.toFixed(0)} tok/s`;
   }
   return msg;
+}
+
+/**
+ * 这一行里有没有一个真实读数（而不是清一色的 —）。
+ * 全是 — 的话不如不输出 —— 一行占位符对用户没有信息量。
+ */
+function hasAnyRealReading(round, show) {
+  if (show.has("ttft") && round.ttftMs != null) return true;
+  if (show.has("decode") && round.decodeTps > 0) return true;
+  if (show.has("cache") && round.cache) return true;
+  if (show.has("tps") && round.durMs > 0) return true;
+  if (show.has("tokens") && round.tokens >= 1) return true;
+  if (show.has("thinking") && round.thinkingTokens > 0) return true;
+  if (show.has("model") && round.model) return true;
+  if (show.has("effort") && round.effort) return true;
+  if (show.has("skill") && round.skill) return true;
+  return false;
 }
 
 function readStdin() {
@@ -132,30 +172,31 @@ async function main() {
       .filter(Boolean)
   );
 
-  const targetId = tracker.currentId;
+  // 等一轮落盘再读数：Stop 事件到达时，最后若干行可能还在缓冲。
+  // 判据是「本轮出现过的 API 调用里有任意一个带上了 usage」——
+  // 只盯某一个 id 会一直等不到（usage 只落在少数 id 上）。
   const attempts = 4;
   await new Promise((resolve) => {
     const attempt = (left) => {
       tracker.pump();
-      const g = targetId ? tracker.groups.get(targetId) : tracker.currentGroup();
-      // 拿到 usage 精确值就可以走了；否则再多等几轮，尽量别用估算值
-      if (g && g.out > 0) return resolve();
+      const t = tracker.turn;
+      const gotUsage = t && t.order.some((id) => t.byId.get(id).hasUsage);
+      if (gotUsage) return resolve();
       if (left > 0) return setTimeout(() => attempt(left - 1), 120);
       resolve();
     };
     attempt(attempts);
   });
 
-  // 取本轮读数：用 latestRound（不走统计过滤器），否则短回复会被
-  // MIN_SAMPLE_TOKENS=50 吃掉，用户设的 CC_TOOLKIT_MIN_TOKENS 就形同虚设。
-  // force=true —— Stop 事件本身就是「本轮已结束」的信号，不必再等流式窗口。
+  // 取本轮读数：latestRound 给的是「用户视角的一轮」（你发消息 → 回复结束），
+  // 不走统计过滤器 —— 否则短回复会被 MIN_SAMPLE_TOKENS=50 吃掉，
+  // 用户设的 CC_TOOLKIT_MIN_TOKENS 就形同虚设。
   const round = tracker.latestRound({ force: true });
   if (!round) return silent("没有可报告的轮次");
 
   if (round.tokens < minTokens) {
     return silent(`样本太小 (${Math.round(round.tokens)} < ${minTokens} tok)`);
   }
-  if (!(round.durMs > 0)) return silent("耗时无效");
 
   // 聚合量：中位数等只在用户把 median 加进 CC_TOOLKIT_SHOW 时才需要
   const samples = show.has("median") ? tracker.recentSamples(undefined, { force: true }) : [];
@@ -180,8 +221,12 @@ async function main() {
 
   let msg = composeMessage(round, rollup, { show });
   if (alerts.length) msg += (msg ? "\n" : "") + alerts.join("\n");
-  // 三个读数都取不到（单块回复 + 没有 usage）时没有可展示的内容
-  if (!msg) return silent("没有可展示的字段");
+
+  // 三格全是 — 时（连 token 都没有的极短回复）没有可展示的内容，
+  // 但只要有任何一个真实读数就照常输出 —— 哪怕另外两格是 —。
+  if (!hasAnyRealReading(round, show) && !alerts.length) {
+    return silent("三个读数都没测到");
+  }
 
   const payload = { systemMessage: msg };
 
