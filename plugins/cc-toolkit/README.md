@@ -5,7 +5,6 @@
 - 每轮回复结束后显示首字等待 / 每秒输出 / 缓存命中三个读数（Stop hook，自动生效）
 - `/cc-toolkit:tps` 查看历史分布、趋势与离群样本
 - `/cc-toolkit:tps --insights` 按 effort / 模型 / 技能 / MCP 分组对比，并看缓存命中与重试
-- 可选把读数放进状态栏
 - 零 npm 依赖、纯本地计算、不联网
 
 ```
@@ -31,7 +30,6 @@
 | 想要的效果 | 怎么做 |
 | --- | --- |
 | 开箱即用的每轮读数 | 安装后自动生效，无需配置 |
-| 打开状态栏读数 | 见仓库根 README 的「状态栏集成」 |
 | 每轮只看其中几项 | `settings.json` → `env.CC_TOOLKIT_SHOW = "ttft,cache"` |
 | 关掉截断/重试提示 | `settings.json` → `env.CC_TOOLKIT_ALERTS = "0"` |
 | 调整显示下限 | `settings.json` → `env.CC_TOOLKIT_MIN_TOKENS = "50"` |

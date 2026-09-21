@@ -2,7 +2,7 @@
 
 实时监控 **Claude Code 的输出速度（tok/s）**。
 
-装好即在每轮回复后看到首字等待 / 每秒输出 / 缓存命中；`/cc-toolkit:tps` 查看历史分布、趋势、离群样本与分层归因；可选把读数放进状态栏。
+装好即在每轮回复后看到首字等待 / 每秒输出 / 缓存命中；`/cc-toolkit:tps` 查看历史分布、趋势、离群样本与分层归因。
 零 npm 依赖、纯本地计算、不联网、不上报。
 
 ```
@@ -55,7 +55,6 @@ API 错误: 3 次 [ECONNRESET×3]，其中 3 次触发了重试
 - [安装方法](#安装方法)
 - [hooks 配置方法](#hooks-配置方法)
 - [斜杠命令](#斜杠命令)
-- [状态栏集成（可选）](#状态栏集成可选)
 - [环境变量开关](#环境变量开关)
 - [数据来源与精度](#数据来源与精度)
 - [故障排查](#故障排查)
@@ -74,8 +73,7 @@ cc-toolkit 从 Claude Code 自己写的会话日志里算出每一轮的真实�
 
 - 换了一个 API 供应商 / 网关，想知道吞吐到底差多少；
 - 调 `effortLevel` 或换模型，想看速度与质量的实际取舍；
-- 会话突然变卡，想确认是模型慢、还是工具调用多、还是自己在读大文件；
-- 就想在状态栏里一直看到那个数字。
+- 会话突然变卡，想确认是模型慢、还是工具调用多、还是自己在读大文件。
 
 ---
 
@@ -224,7 +222,7 @@ echo '{"session_id":"t","transcript_path":"/path/to/session.jsonl","hook_event_n
 | --- | --- |
 | `/cc-toolkit:tps [条数]` | 多行快照：当前一轮 + **首字等待/纯解码拆分** + 最近 N 条 + 中位/p90/最快/最慢 + 趋势与离群样本，并附**分层归因**（按 effort / 模型 / 技能 / MCP / 是否带 thinking 分组对比）与会话级事实（缓存命中、API 重试、截断）。参数默认 10，可加 `--all` 回放整个会话文件 |
 | `/cc-toolkit:tps-live [参数]` | 生成实时监视命令（前台长驻，Ctrl-C 退出）。可选 `--interval=500`、`-p 项目目录名` |
-| `/cc-toolkit:tps-doctor` | 环境自检：Node 版本、会话目录、能否定位当前会话、hook / 状态栏该往哪配 |
+| `/cc-toolkit:tps-doctor` | 环境自检：Node 版本、会话目录、能否定位当前会话、hook 是否生效 |
 
 命令行等价形式（不装插件也能用）：
 
@@ -257,85 +255,6 @@ node plugins/cc-toolkit/scripts/cc-watch.js --json --history=5
 
 ---
 
-## 状态栏集成（可选）
-
-状态栏每次刷新都会调用脚本，所以插件把**最近一次 Stop hook 的结果缓存到临时目录**，状态栏优先读缓存，
-读不到才回放会话末尾 400KB。不会因为状态栏而反复扫大文件。
-
-在 `~/.claude/settings.json` 里加（`statusLine` 与 `hooks` 平级）：
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/cc-statusline.js\"",
-    "padding": 0
-  }
-}
-```
-
-注意：`${CLAUDE_PLUGIN_ROOT}` 同样只在插件 hook 里替换 —— 但 `statusLine` 属于 `settings.json`，
-所以这里**要写绝对路径**：
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "node \"C:/Users/me/cc-toolkit/plugins/cc-toolkit/scripts/cc-statusline.js\""
-  }
-}
-```
-
-输出形如 `⚡ 89 tok/s · 首字 3.2s · 缓存 92%`。
-
-状态栏空间有限，所以它比 hook 那行更简省：只有 `tps` 直接给数字（`tok/s` 自带单位），
-其余段用短标签（「每秒输出」缩短成「解码」）。字段含义与 hook 那行相同，用
-`CC_TOOLKIT_STATUSLINE_FIELDS` 控制显示哪些段（逗号分隔）：
-
-- `tps` → `89 tok/s`：整轮速度（含 prefill）
-- `ttft` → `首字 3.2s`：首字等待
-- `decode` → `解码 227`：每秒输出，纯解码（扣掉首字等待，与「首字」正交）
-- `cache` → `缓存 92%`：缓存命中率
-- `median` → `中位 151`：近 9 条样本的整轮速度中位（不是 decode 中位）
-
-注意 `CC_TOOLKIT_STATUSLINE_FIELDS` 只认这五个名字。hook 的 `CC_TOOLKIT_SHOW` 另外还有
-`tokens` / `thinking` / `model` / `effort` / `skill`，状态栏不渲染 —— 照搬过去不会报错，
-只是那一段不出现。
-
-另有两段附加后缀，不占字段名、每次刷新可能出现也可能不出现：
-
-- `⚠ 截断`（渲染为 `⚠截断`）：本轮被 `max_tokens` 截断，受 `CC_TOOLKIT_ALERTS` 控制；
-- `(缓存中位 92%)`：开了 `median` 且本轮没有缓存读数时，补一段历史缓存中位。
-
-默认 `tps,ttft,cache`。例如只想要一个数字 —— 注意 `tps` 是含 prefill 的整轮口径，
-想看纯生成速度应该选 `decode`：
-
-```json
-{ "env": { "CC_TOOLKIT_STATUSLINE_FIELDS": "decode" } }
-```
-
-**读到空输出是正常的**：选中的段可能恰好都取不到 —— 单块回复没有可测的 `decode` 区间、
-没有 usage 的轮次没有 `cache` 可算、或本轮 token 数低于 `CC_TOOLKIT_MIN_TOKENS`。
-这种时候状态栏整段不输出，而不是留一个光秃秃的 `⚡ `。
-
-如果你已经有自己的状态栏脚本了，不想换掉整个 statusLine，可以让它内部调一下本脚本。
-**必须把 Claude Code 传来的 stdin 原样转发进去** —— 脚本要从里面取 `session_id` /
-`transcript_path` 才能定位会话，读不到就直接输出空：
-
-```bash
-TPS=$(printf '%s' "$INPUT" | node "/path/to/cc-toolkit/plugins/cc-toolkit/scripts/cc-statusline.js")
-```
-
-注意别用 `</dev/null` 做自测：那样脚本拿不到会话信息，永远输出空，
-看起来像状态栏坏了。要验证它有没有工作，喂一段真实的状态栏输入：
-
-```bash
-echo '{"session_id":"<会话id>","transcript_path":"~/.claude/projects/<项目目录名>/<会话id>.jsonl"}' \
-  | node "/path/to/cc-toolkit/plugins/cc-toolkit/scripts/cc-statusline.js"
-```
-
----
-
 ## 环境变量开关
 
 hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `env` 里设置即可对 hook 生效：
@@ -350,14 +269,11 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
-| `CC_TOOLKIT_DISABLE` | — | 设为 `1` 完全禁用（hook 与状态栏都静默退出） |
+| `CC_TOOLKIT_DISABLE` | — | 设为 `1` 完全禁用（hook 静默退出） |
 | `CC_TOOLKIT_MIN_TOKENS` | `30` | 低于该 token 数不报告，避免"嗯"一声也弹个数。设为 `0` 表示不设下限。**只作用于本轮读数**，不影响中位数等统计聚合 |
 | `CC_TOOLKIT_SHOW` | `ttft,decode,cache` | 每轮那行包含哪些字段，用 ` \| ` 连接。默认就是三个原始读数。可选 `ttft`（首字等待）`decode`（每秒输出/纯解码）`cache`（缓存命中）`tps`（整轮速度）`median`（近 9 条中位）`tokens`（本轮 token）`thinking` `model` `effort` `skill`。例如只留速度：`CC_TOOLKIT_SHOW=decode,tps` |
-| `CC_TOOLKIT_ALERTS` | 开 | 设为 `0` 关掉 hook 与状态栏的截断提示。缓存命中率不在此列 —— 它本身就是默认显示的读数之一。refusal / API 重试这两条只在 hook 里报 |
+| `CC_TOOLKIT_ALERTS` | 开 | 设为 `0` 关掉截断 / refusal / API 重试的附加提示。缓存命中率不在此列 —— 它本身就是默认显示的读数之一 |
 | `CC_TOOLKIT_VERBOSE` | — | 设为 `1` 把诊断信息写到 stderr |
-| `CC_TOOLKIT_STATUSLINE_PREFIX` | `⚡ ` | 状态栏前缀 |
-| `CC_TOOLKIT_STATUSLINE_FIELDS` | `tps,ttft,cache` | 状态栏显示哪些段，用 ` · ` 连接。可选 `tps`（整轮速度）`ttft`（首字等待）`decode`（每秒输出）`cache`（缓存命中）`median`（近 9 条中位；开启后会附带 `(缓存中位 N%)`）。**只认这五个名字** —— hook 的 `CC_TOOLKIT_SHOW` 另有 `tokens`/`thinking`/`model`/`effort`/`skill`，状态栏不渲染 |
-| `CC_TOOLKIT_STATUSLINE_CACHE_MS` | `45000` | 状态栏缓存有效期（毫秒）。设为 `0` 表示不用缓存，每次刷新都重算 |
 
 只想临时静音一轮，直接在 shell 里 `export CC_TOOLKIT_DISABLE=1` 再启动 Claude Code 即可。
 
@@ -384,8 +300,8 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 | 响应已结束，`usage.output_tokens` 已落盘 | **精确**：真实 token ÷ 真实耗时 | 无标记 |
 | 响应正在流式，usage 还没写 | **估算**：块内容按字符数换算（CJK ≈ 1.5 字符/tok，其余 ≈ 4 字符/tok） | `≈` |
 
-所有输出都用 `≈` 明确区分两者，不会拿估算值冒充精确值。hook 与状态栏一致：
-估算值所在的每一段都带 `≈`（hook 的「每秒输出」与状态栏的「解码」同样如此）。
+所有输出都用 `≈` 明确区分两者，不会拿估算值冒充精确值：
+估算值所在的每一段都带 `≈`（hook 的「每秒输出」与「整轮」同样如此）。
 usage 落盘后估算值会被自动替换掉。
 
 ### 读数口径，别混着看
@@ -409,17 +325,11 @@ usage 落盘后估算值会被自动替换掉。
 **`每秒输出` 显示为空是正常的**：只有 ≥2 个内容块、且首末块间隔 ≥300ms 才算得出。
 实测 29% 的轮次时间戳只差 1–3ms（Claude Code 把多个块一次性写盘），这种根本没有可测区间，
 插件宁可留空也不报一个上百万 tok/s 的假数字，也不用含 prefill 的整轮速度去顶替它。
-状态栏的 `decode` 段同理；如果它是你选中的唯一一段，这一轮的状态栏就整段不显示。
 
-**状态栏的「首字」偶尔整段不显示**：状态栏为了便宜只回放会话末尾 400KB，
+**「首字」偶尔整段不显示**：为控制启动开销，插件只回放会话末尾 2MB，
 切点可能正好落在某一轮的用户行与其首个内容块之间 —— 那一轮的起点锚就没读到。
-这种情况插件会从缓存里补回：hook 用 2MB 窗口已经算准过这一轮的「首字」与起点，
-只要还是同一轮（末块时间戳对得上）就直接复用，读数与 hook 完全一致。
-只有在**从未算准过**的时候（冷启动、还没写过缓存）才留空 —— 不显示，也不编一个值，
-同时这一轮不会被计进中位数/p90。
-
-想彻底避免这种切换，把 `CC_TOOLKIT_STATUSLINE_CACHE_MS` 调小，
-让读数更多由 Stop hook（回放 2MB）来写。
+这种情况插件留空：不显示，也不编一个值，同时这一轮不会被计进中位数/p90。
+想看窗口之外的轮次，用 `/cc-toolkit:tps --all` 回放整个会话文件。
 
 ### 其他口径
 
@@ -462,8 +372,8 @@ usage 落盘后估算值会被自动替换掉。
 
 **Q: 完全看不到任何输出**
 
-1. 先确认 hook 到底跑没跑——看状态缓存的修改时间：
-   `<临时目录>/cc-toolkit-<会话id>.json`（`%TEMP%` / `$TMPDIR`）；
+1. 先确认 hook 到底跑没跑——在会话文件里搜 `stop_hook_summary`，
+   它的 `hookInfos` 会列出**真正执行过**的命令（见下一问）；
 2. 跑 `/cc-toolkit:tps-doctor` 看环境（它会解析并打印当前定位到的插件目录）；
 3. 确认 Node 能跑：`node --version`；
 4. 手动喂一个假事件看 hook 的原始输出：
@@ -486,10 +396,7 @@ echo '{"session_id":"t","transcript_path":"C:/Users/me/.claude/projects/项目�
 
 **Q: 怎么确认 hook 到底跑没跑？**
 
-hook 每次执行都会往临时目录写一份状态缓存 `<tmp>/cc-toolkit-<会话id>.json`。
-看它的修改时间就知道有没有在跑（`%TEMP%` / `$TMPDIR`）。
-
-想看得更细，检查 transcript 里的 `stop_hook_summary` 记录，它的 `hookInfos`
+检查 transcript 里的 `stop_hook_summary` 记录，它的 `hookInfos`
 列出了**真正执行过**的命令：
 
 ```bash
@@ -555,11 +462,10 @@ cc-plugins/                             # 仓库名 = 市场名
 │       ├── scripts/
 │       │   ├── cc-core.js            # 计算引擎：日志解析 / 轮次归档 / tok-s 统计 / 渲染
 │       │   ├── cc-watch.js           # CLI：实时 / --once / --report / --json
-│       │   ├── cc-hook.js            # Stop hook：回吐 systemMessage + 写状态栏缓存
-│       │   ├── cc-statusline.js      # 状态栏：读缓存，输出单行读数
+│       │   ├── cc-hook.js            # Stop hook：每轮回复后回吐 systemMessage
 │       │   └── cc-doctor.js          # 环境自检
 │       ├── tests/
-│       │   └── cc-toolkit.test.js    # 86 个测试，Node 内置测试运行器，零依赖
+│       │   └── cc-toolkit.test.js    # 60 个测试，Node 内置测试运行器，零依赖
 │       └── LICENSE
 ├── LICENSE
 └── README.md
@@ -597,7 +503,7 @@ claude plugin validate .
 claude plugin details cc-toolkit
 ```
 
-（正常应显示 `Skills (4)` + `Hooks (1) Stop`，且 Stop hook 标注为 `harness-only — no model context cost`。）
+（正常应显示 `Skills (3)` + `Hooks (1) Stop`，且 Stop hook 标注为 `harness-only — no model context cost`。）
 
 hook 的调试开关：
 

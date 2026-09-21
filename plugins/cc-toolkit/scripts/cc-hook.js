@@ -121,7 +121,6 @@ async function main() {
   const tracker = core.trackerForHookEvent(event, { cwd: process.cwd() });
   if (!tracker) return silent("定位不到会话文件");
 
-  const sessionId = event.session_id || require("path").basename(tracker.file).replace(/\.jsonl$/, "");
   // 显式给定的 0 有意义（MIN_TOKENS=0 = 全显示），不能用 `|| 默认值` 一起换掉
   const minTokensRaw = parseInt(env.CC_TOOLKIT_MIN_TOKENS, 10);
   const minTokens = Number.isFinite(minTokensRaw) && minTokensRaw >= 0 ? minTokensRaw : 30;
@@ -185,13 +184,6 @@ async function main() {
   if (!msg) return silent("没有可展示的字段");
 
   const payload = { systemMessage: msg };
-
-  // 把状态落盘，供 statusline 直接读取（避免它每次刷新都回放 2MB 日志）
-  try {
-    core.writeCache(sessionId, tracker.snapshot({ force: true }));
-  } catch {
-    /* 缓存失败无所谓 */
-  }
 
   debug("输出:", msg);
   respond(payload);

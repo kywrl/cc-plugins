@@ -4,6 +4,42 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.1.0] - 2026-09-21
+
+状态栏集成整条移除。它服务的场景（把读数常驻在状态栏）与插件的主路径重叠，
+却要在每一轮回复后额外往临时目录写一份跨进程缓存 —— 这份缓存**只有一个读者**，
+删掉状态栏后就是纯粹的每轮多余磁盘写入。
+
+### 移除
+
+- **删掉 `cc-statusline.js`**，以及 `README` 的「状态栏集成（可选）」整节、
+  目录入口与 `plugin.json` 的 `statusline` 关键词。原先要把 `${CLAUDE_PLUGIN_ROOT}`
+  写进 `settings.json` 的 `statusLine`（那里不做变量替换，必须写绝对路径），
+  是插件里唯一一处需要用户手工配置的地方。
+
+- **跨进程缓存层**（`cc-core.js` 的 `readCache` / `writeCache` / `cacheFileFor` /
+  `CACHE_VERSION`）。这三个函数只为状态栏存在：hook 写、状态栏读。
+  hook 里那段 `writeCache` 调用一并删掉，每轮不再有额外的临时文件写入。
+
+- **`snapshot()`**。它序列化全量样本与聚合量，唯一的调用方就是 hook 的写缓存；
+  hook 需要的中位数走 `rollup()`，该方法保留。
+
+- **三个环境变量**：`CC_TOOLKIT_STATUSLINE_PREFIX` / `CC_TOOLKIT_STATUSLINE_FIELDS` /
+  `CC_TOOLKIT_STATUSLINE_CACHE_MS`。`cc-doctor` 的状态栏段落与「缓存目录」一行同样删掉。
+
+### 保留
+
+- Stop hook 与它每轮输出的「首字 / 每秒输出 / 缓存命中」—— 完全不变。
+- 斜杠命令 `/cc-toolkit:tps`、`tps-live`、`tps-doctor` 与 `cc-watch.js`、`cc-doctor.js`。
+
+### 测试
+
+- 移除 26 个只服务于已删模块的测试（`statusline:` 端到端、`缓存：` 单元、
+  README 状态栏字段表对照），以及只为 400KB 切点场景存在的 `writeLongToolRound` 夹具。
+- 词表守卫新增两条：`statusline` / `statusLine`（不分大小写）与 `CC_TOOLKIT_STATUSLINE_`
+  出现在面向用户的文档或描述里即判失败。
+  **86 → 60 个测试。**
+
 ## [2.0.5] - 2026-09-21
 
 插件自带的 hook 一直能正常工作，而「手工挂进 `settings.json`」那条自救路径不仅多余，

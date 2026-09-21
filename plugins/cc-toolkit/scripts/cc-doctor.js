@@ -4,14 +4,13 @@
  * cc-doctor — 环境自检
  *
  * 装完插件后跑一下，确认：Node 版本够不够、会话目录在不在、
- * 当前工作目录能不能定位到会话文件、hook / statusline 该往哪配。
+ * 当前工作目录能不能定位到会话文件、hook 跑没跑起来。
  *
  * 用法: node scripts/cc-doctor.js
  */
 
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 const core = require("./cc-core");
 
 const OK = "✅";
@@ -113,18 +112,12 @@ say("");
 say("   没生效？先确认它到底跑没跑：在会话文件里搜 stop_hook_summary，");
 say("   hookInfos 会列出真正执行过的命令。");
 say("");
-say(`${OK} 状态栏(可选): node "${path.join(__dirname, "cc-statusline.js")}"`);
-say("   → 需手工写进 settings.json 的 statusLine；粘贴即用的片段见 README。");
-say("");
 say("环境变量开关");
 say("────────────");
-say("  CC_TOOLKIT_DISABLE=1             临时关闭（hook 与状态栏都受控）");
+say("  CC_TOOLKIT_DISABLE=1             临时关闭");
 say("  CC_TOOLKIT_MIN_TOKENS=30         低于该 token 数的响应不报告");
 say("  CC_TOOLKIT_SHOW=ttft,decode,cache  每轮那行包含哪些字段");
 say("  CC_TOOLKIT_ALERTS=0              关掉截断 / refusal / 重试的附加提示");
 say("  CC_TOOLKIT_VERBOSE=1             把诊断信息写到 stderr");
-
-say("");
-say(`缓存目录: ${os.tmpdir()}`);
 
 process.stdout.write(lines.join("\n") + "\n");
