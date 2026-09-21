@@ -16,8 +16,11 @@
  *   CC_TOOLKIT_MIN_TOKENS=30       低于该 token 数不显示
  *   CC_TOOLKIT_STATUSLINE_CACHE_MS 缓存有效期，默认 45000
  *   CC_TOOLKIT_STATUSLINE_FIELDS   显示的字段，逗号分隔，默认 "tps,ttft,cache"
- *                                  可选: tps(整轮速度) median(近9条中位)
- *                                        ttft(首字等待) decode(纯解码) cache(缓存命中)
+ *                                  字段含义与 hook 的 CC_TOOLKIT_SHOW 一致：
+ *                                    tps(整轮速度) ttft(首字等待)
+ *                                    decode(每秒输出/纯解码) cache(缓存命中)
+ *                                    median(近期中位)
+ *                                  状态栏更简省：不带标签、用 " · " 连接
  *   CC_TOOLKIT_DISABLE=1           禁用（输出空）
  */
 

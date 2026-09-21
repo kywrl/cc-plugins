@@ -376,8 +376,15 @@ node plugins/cc-toolkit/scripts/cc-watch.js --json --history=5
 
 输出形如 `⚡ 89 tok/s · 首字 3.2s · 缓存 92%`。
 
-显示哪些字段可以用 `CC_TOOLKIT_STATUSLINE_FIELDS` 控制（逗号分隔）：
-`tps`（整轮速度）、`median`（近 9 条中位）、`ttft`（首字等待）、`decode`（纯解码）、`cache`（缓存命中）。
+状态栏空间有限，所以它比 hook 那行更简省：不带「整轮」「每秒输出」这类标签，只给数字。
+字段含义与 hook 那行完全一致。用 `CC_TOOLKIT_STATUSLINE_FIELDS` 控制显示哪些段（逗号分隔）：
+
+- `tps` → `89 tok/s`：整轮速度（含 prefill）
+- `ttft` → `首字 3.2s`：首字等待
+- `decode` → `解码 227`：每秒输出，纯解码（扣掉首字等待，与「首字」正交）
+- `cache` → `缓存 92%`：缓存命中率
+- `median` → `中位 151`：近期中位数
+
 默认 `tps,ttft,cache`。例如只想要一个数字：
 
 ```json
@@ -412,7 +419,7 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 | `CC_TOOLKIT_ALERTS` | 开 | 设为 `0` 关掉附加提示（max_tokens 截断 / refusal / API 重试）。缓存命中率不在此列 —— 它本身就是默认显示的读数之一 |
 | `CC_TOOLKIT_VERBOSE` | — | 设为 `1` 把诊断信息写到 stderr |
 | `CC_TOOLKIT_STATUSLINE_PREFIX` | `⚡ ` | 状态栏前缀 |
-| `CC_TOOLKIT_STATUSLINE_FIELDS` | `tps,ttft,cache` | 状态栏显示哪些段 |
+| `CC_TOOLKIT_STATUSLINE_FIELDS` | `tps,ttft,cache` | 状态栏显示哪些段。字段含义同 `CC_TOOLKIT_SHOW`，但状态栏更简省：不带标签、用 ` · ` 连接。可选 `tps`（整轮速度）`ttft`（首字等待）`decode`（每秒输出）`cache`（缓存命中）`median`（近期中位） |
 | `CC_TOOLKIT_STATUSLINE_CACHE_MS` | `45000` | 状态栏缓存有效期（毫秒） |
 
 只想临时静音一轮，直接在 shell 里 `export CC_TOOLKIT_DISABLE=1` 再启动 Claude Code 即可。
