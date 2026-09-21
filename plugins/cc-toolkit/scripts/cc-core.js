@@ -252,13 +252,17 @@ class SessionTracker {
     return this;
   }
 
-  _groupOf(id, startTs) {
+  _groupOf(id, startTs, { anchorSeen = true } = {}) {
     let g = this.groups.get(id);
     if (!g) {
       // out = usage 里的精确输出 token 数；est = 由内容字符数估算（仅无 usage 时兜底）
       g = {
         id,
         start: startTs,
+        // anchorSeen=false：本轮的起点锚（用户行）落在回放窗口之外，
+        // start 只能用首个内容块兜底。此时「首字等待」和「整轮耗时」都是
+        // 算不出来的（分母少了一整段 prefill），必须标出来而不是照常输出。
+        anchorSeen,
         end: startTs,
         out: 0,
         est: 0,
@@ -334,7 +338,9 @@ class SessionTracker {
     this.lastRound = round;
 
     // 统计样本才需要过滤：太短的轮次方差极大，混进中位数/p90 会污染聚合结果。
-    if (round.tokens >= MIN_SAMPLE_TOKENS && round.durMs > MIN_SAMPLE_MS) {
+    // truncatedAnchor 同理必须排除：那一轮的 durMs 少了一整段首字等待，
+    // tps 会系统性偏高（实测 57 → 133），是数据缺口造成的假读数。
+    if (!round.truncatedAnchor && round.tokens >= MIN_SAMPLE_TOKENS && round.durMs > MIN_SAMPLE_MS) {
       this.samples.push(round);
     }
     if (this.samples.length > MAX_SAMPLES) this.samples.shift();
@@ -380,11 +386,13 @@ class SessionTracker {
       partial: !streaming && estimated,
       durMs,
       tps,
-      ttftMs: g.ttftMs,
+      // 锚点没见到（本轮的用户行在回放窗口之外）时，firstBlockAt - start 恒为 0，
+      // 报 0 会被渲染成「首字 0.0s」。宁可 null —— 这正是 decodeTps 的处理方式。
+      ttftMs: g.anchorSeen ? g.ttftMs : null,
       // 单块回复里首块即末块，ttft 恒等于整轮耗时 —— 此时把「首字 X.Xs」
       // 和「整轮 X.Xs」一起显示只是重复，反而让人以为是 bug。这种轮次
       // 只在真的存在「首块之后还有内容」时才算有可展示的首字等待。
-      ttftMeaningful: g.ttftMs != null && g.end - g.start - g.ttftMs > MIN_DECODE_MS,
+      ttftMeaningful: g.anchorSeen && g.ttftMs != null && g.end - g.start - g.ttftMs > MIN_DECODE_MS,
       decodeMs,
       decodeTps,
       // 区分「只有一个块所以拆不了」与「块被一次性写盘、跨度测不出来」
@@ -396,6 +404,10 @@ class SessionTracker {
             : decodeMs < MIN_DECODE_MS
               ? "not-measurable"
               : "no-usage",
+      // truncated-anchor：本轮的起点锚（用户行）没进回放窗口，start 退化成首个
+      // 内容块。此时 durMs/tps 的分母少了一整段首字等待，读数会明显偏高
+      //（实测同一轮 57 tok/s 被算成 133），不能当作正常样本聚合。
+      truncatedAnchor: !g.anchorSeen,
       thinkingTokens,
       thinkingShare,
       blocks: g.blocks,
@@ -472,6 +484,7 @@ class SessionTracker {
     if (!force && now - g.end < STREAMING_WINDOW_MS) return this.samples;
 
     const round = this._describe(g, { force: true, now });
+    if (round.truncatedAnchor) return this.samples;
     if (round.tokens < MIN_SAMPLE_TOKENS || round.durMs <= MIN_SAMPLE_MS) return this.samples;
     return [...this.samples, round];
   }
@@ -557,7 +570,12 @@ class SessionTracker {
         this.currentId = id;
       }
 
-      const g = this._groupOf(id, this.lastTs ?? ts ?? Date.now());
+      // 起点锚是本轮开始前最后见到的那一行的时间戳。回放窗口从文件中途开始时，
+      // 本轮的用户行可能已经被切掉、lastTs 还是 null —— 这时 start 只能用
+      // 首个内容块兜底，durMs 会少掉一整段首字等待（见 anchorSeen）。
+      const g = this._groupOf(id, this.lastTs ?? ts ?? Date.now(), {
+        anchorSeen: this.lastTs != null,
+      });
 
       // TTFT 只在本轮第一个块落盘时算一次
       if (g.firstBlockAt == null && ts) {

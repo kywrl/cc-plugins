@@ -8,6 +8,10 @@
  *   2. 缓存缺失或过期 → 只回放 transcript 末尾 400KB 重算一次，然后写回缓存。
  * 绝不做全量回放；缓存里只存 lastRound 与预先算好的聚合量，本身不遍历样本。
  *
+ * 400KB 这个切点可能落在某一轮的用户行与首个内容块之间，那一轮的起点锚就丢了 ——
+ * core 会把这种轮次标成 truncatedAnchor：不显示首字，也不让它进统计聚合
+ *（详见 cc-core.js 的 _describe）。hook 走默认的 2MB，基本碰不到这种情况。
+ *
  * 用法（放进 settings.json 的 statusLine.command）:
  *   node "${CLAUDE_PLUGIN_ROOT}/scripts/cc-statusline.js"
  *

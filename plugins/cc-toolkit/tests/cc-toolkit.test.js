@@ -992,6 +992,122 @@ test("SessionTracker: 块被一次性写盘时不报解码速度", () => {
   assert.equal(r.ttftMeaningful, false);
 });
 
+test("SessionTracker: 回放窗口切断起点锚时，首字与整轮速度都算不出来", () => {
+  // 状态栏只回放末尾 400KB，切点可能落在某一轮的用户行与其首个内容块之间。
+  // 锚点没了，start 只能用首个内容块兜底 —— 这时：
+  //   · firstBlockAt - start 恒为 0，报 0 会被渲染成「首字 0.0s」；
+  //   · durMs 少掉一整段首字等待，tps 系统性偏高。
+  // 两者都必须标成「测不出来」，而不是给假读数。
+  const dir = fs.mkdtempSync(path.join(tmpRoot, "anchor-"));
+  const file = path.join(dir, "anchor.jsonl");
+  const t0 = Date.parse("2026-01-01T00:00:00Z");
+
+  // 一轮：用户发消息 → 等 3s 才有首块 → 4 个块横跨 4s。整轮 7s / 400 tok = 57 tok/s。
+  const rows = [
+    JSON.stringify({ type: "user", timestamp: new Date(t0).toISOString(), message: { role: "user", content: "p" } }),
+  ];
+  for (let i = 0; i < 4; i++) {
+    rows.push(
+      JSON.stringify({
+        type: "assistant",
+        timestamp: new Date(t0 + 3000 + i * 1000).toISOString(),
+        message: {
+          id: "msg_anchor",
+          role: "assistant",
+          content: [{ type: "text", text: "x".repeat(400) }],
+          usage: i === 3 ? { output_tokens: 400 } : undefined,
+        },
+      })
+    );
+  }
+  const body = rows.join("\n") + "\n";
+  fs.writeFileSync(file, body, "utf8");
+
+  // 切点落在用户行内部：offset = size - tail，想让它停在用户行的后半段，
+  // 就用 tail = size - (用户行长度 - 20)。
+  const size = Buffer.byteLength(body, "utf8");
+  const userLen = Buffer.byteLength(rows[0], "utf8");
+  const r = new core.SessionTracker(file)
+    .start({ replayTailBytes: size - (userLen - 20) })
+    .latestRound({ force: true });
+
+  assert.ok(r, "被切断锚点的那一轮仍要能作为「最新一轮」读到");
+  assert.equal(r.ttftMs, null, "锚点没见到就不该报 0 —— 那会被渲染成「首字 0.0s」");
+  assert.equal(r.ttftMeaningful, false, "测不出来的首字不该展示");
+  assert.equal(r.truncatedAnchor, true, "要标出这一轮的锚点被窗口切掉了");
+  assert.ok(r.tps > 100, "整轮速度确实会因缺失锚点而偏高（这正是它不能进聚合的原因）");
+
+  // 对照：完整读到用户行时一切正常
+  const ok = new core.SessionTracker(file).start({ replayTailBytes: 1e9 }).latestRound({ force: true });
+  assert.equal(ok.truncatedAnchor, false);
+  assert.equal(ok.ttftMs, 3000);
+  // 锚点在 t0，末块在 t0+6000 → 整轮 6s / 400 tok = 67 tok/s
+  assert.equal(Math.round(ok.tps), 67, "整轮 6s / 400 tok");
+});
+
+test("SessionTracker: 锚点被切断的轮次不进统计聚合", () => {
+  // 它的 tps 分母少了一段首字等待，混进中位数会系统性偏高。
+  // 让被切断的那一轮**归档**（后面再出现新的 message.id），它才会走到样本过滤器 ——
+  // 否则它只是「当前轮」，测不到这条过滤。
+  const dir = fs.mkdtempSync(path.join(tmpRoot, "anchanchor-"));
+  const file = path.join(dir, "aa.jsonl");
+  const t0 = Date.parse("2026-01-01T00:00:00Z");
+  const rows = [];
+  const push = (ts, id, usage) =>
+    rows.push(
+      JSON.stringify({
+        type: "assistant",
+        timestamp: new Date(ts).toISOString(),
+        message: { id, role: "assistant", content: [{ type: "text", text: "x".repeat(400) }], usage },
+      })
+    );
+
+  // 第一轮：用户行 + 3 块，整轮正常
+  rows.push(JSON.stringify({ type: "user", timestamp: new Date(t0).toISOString(), message: { role: "user", content: "p" } }));
+  push(t0 + 800, "msg_a", undefined);
+  push(t0 + 1600, "msg_a", undefined);
+  push(t0 + 2400, "msg_a", { output_tokens: 400 });
+
+  // 第二轮：这一轮的用户行会被切掉
+  const userLine = JSON.stringify({
+    type: "user",
+    timestamp: new Date(t0 + 5000).toISOString(),
+    message: { role: "user", content: "p" },
+  });
+  rows.push(userLine);
+  push(t0 + 10000, "msg_b", undefined);
+  push(t0 + 11000, "msg_b", undefined);
+  push(t0 + 12000, "msg_b", { output_tokens: 400 });
+
+  // 第三轮：只为把 msg_b 挤成「已归档」
+  rows.push(JSON.stringify({ type: "user", timestamp: new Date(t0 + 20000).toISOString(), message: { role: "user", content: "p" } }));
+  push(t0 + 20800, "msg_c", undefined);
+  push(t0 + 21600, "msg_c", undefined);
+  push(t0 + 22400, "msg_c", { output_tokens: 400 });
+
+  const body = rows.join("\n") + "\n";
+  fs.writeFileSync(file, body, "utf8");
+
+  // 切在第二轮的用户行内部 → msg_b 的锚点丢失，msg_a 完整保留
+  const size = Buffer.byteLength(body, "utf8");
+  const userStart = Buffer.byteLength(rows.slice(0, 4).join("\n"), "utf8") + 1;
+  const tracker = new core.SessionTracker(file).start({ replayTailBytes: size - (userStart + 20) });
+
+  const samples = tracker.recentSamples(undefined, { force: true });
+  assert.ok(samples.length > 0, "前面那几轮仍在窗口内，样本不该是空的");
+
+  const polluted = samples.filter((d) => d.truncatedAnchor);
+  assert.deepEqual(
+    polluted.map((d) => Math.round(d.tps)),
+    [],
+    "锚点被切断的轮次不该出现在统计样本里（它的 tps 分母是错的）"
+  );
+
+  // 但它仍要能作为「最新一轮」被读到（只不过首字会标成测不出来）
+  const latest = tracker.latestRound({ force: true });
+  assert.ok(latest, "被切断锚点的那一轮仍要能读到");
+});
+
 test("SessionTracker: 解析 thinking token 数与占比", () => {
   const file = patchUsage(
     writeTranscript([{ id: "m", ms: 2000, tokens: 400, chunks: 2 }]),

@@ -91,6 +91,8 @@ function buildJson(tracker, opts) {
     estimated: d.estimated,
     ttftMs: d.ttftMs == null ? null : Math.round(d.ttftMs),
     ttftMeaningful: !!d.ttftMeaningful,
+    // true = 本轮的起点锚落在回放窗口之外，tps / ttft 都是算不出来的
+    truncatedAnchor: !!d.truncatedAnchor,
     decodeTps: d.decodeTps > 0 ? Number(d.decodeTps.toFixed(2)) : null,
     decodeMs: d.decodeMs == null ? null : Math.round(d.decodeMs),
     decodeReason: d.decodeReason,
