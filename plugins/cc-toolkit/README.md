@@ -37,7 +37,7 @@
 | 调整显示下限 | `settings.json` → `env.CC_TOOLKIT_MIN_TOKENS = "50"` |
 | 临时关掉 | `settings.json` → `env.CC_TOOLKIT_DISABLE = "1"` |
 
-**完整的安装方法、hooks 配置方法（含手工挂进 `settings.json` 的写法）、精度说明与故障排查，见
+**完整的安装方法、精度说明与故障排查，见
 [仓库根 README](../../README.md)。**
 
 ## 数据来源

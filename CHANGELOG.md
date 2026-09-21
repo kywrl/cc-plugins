@@ -4,6 +4,59 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.0.5] - 2026-09-21
+
+插件自带的 hook 一直能正常工作，而「手工挂进 `settings.json`」那条自救路径不仅多余，
+还会**静默地把你锁死在旧版本上**。这一版把它整条删掉。
+
+### 移除
+
+- **删掉 `/cc-toolkit:install-hook` 与配套的 `cc-install-hook.js`、`cc-resolve.js`。**
+  `cc-resolve.js` 的唯一实质调用方就是 `install-hook`，一并移除；`cc-doctor` 里
+  依赖它的「插件路径定位」检查段也删掉。
+
+  **为什么**：它生成的命令是
+
+  ```bash
+  node "$(ls -d ~/.claude/plugins/cache/*/cc-toolkit/*/scripts/cc-hook.js | head -1)"
+  ```
+
+  `ls` 的通配符按**字典序**展开，`head -1` 恒选中排在最前的那一个。插件每次升级
+  都会在 `plugins/cache/<市场>/cc-toolkit/` 下新增版本目录而**不删旧的**，于是
+  装了 8 个版本之后 `head -1` 选中的仍是 `1.0.1` —— v2.0.0 起对每轮输出格式的
+  全部改动，在这条命令生效的机器上从未被看到过。
+
+  讽刺的是，仓库里本就有能正确解析版本的 `cc-resolve.js`（读
+  `installed_plugins.json` 的 `installPath`，跟随版本），但 `cc-install-hook.js`
+  绕过了它、自己用 glob 拼路径。
+
+  **同时被推翻的前提**：`install-hook` 存在的理由是「用第三方 `ANTHROPIC_BASE_URL`
+  时插件自带的 hook 不生效」。实测该假设不成立 —— 在第三方 provider 环境下，
+  会话文件里的 `stop_hook_summary` 显示插件自带的
+  `node "${CLAUDE_PLUGIN_ROOT}/scripts/cc-hook.js"` 一直正常执行。
+  Claude Code 在运行时替换 `${CLAUDE_PLUGIN_ROOT}` 为**当前版本**的安装目录，
+  天然跟随版本，不存在 glob 选错的问题。
+
+  **迁移**：如果你曾跑过 `/cc-toolkit:install-hook`，请手工删掉
+  `~/.claude/settings.json` 里 `hooks.Stop` 下命令含 `cc-hook.js` 的那条
+  （那是唯一一条没生效的、还把版本钉死在过去的配置）。删掉后插件自带 hook
+  会接管，无需任何替代配置。若两条都留着，每轮会出现**两条**读数。
+
+### 文档
+
+- 仓库 README 删掉「手工挂进 `settings.json`」整节（B / B-1 / B-2 / C）与
+  `install-hook` 相关 FAQ 条目，`hooks 配置方法` 收敛为「装好即生效」。
+  原先「插件更新后 hook 失效」一问的答案建立在 glob 通配符会跟随版本号的
+  错误假设上，已重写。
+- FAQ 新增指引：判断 hook 是否真的在跑，看 `stop_hook_summary` 的 `hookInfos`
+  列出的**真正执行过的命令**，而不是照着调试日志下结论。
+
+### 测试
+
+- 移除 18 个只服务于已删模块的测试，并补充词表守卫：`install-hook` 与
+  `cc-resolve` 出现在面向用户的文档或描述里即判失败。
+  **104 → 86 个测试。**
+
 ## [2.0.0] - 2026-09-21
 
 每个读数都应该只回答一个从它自身看得出来的问题。上一版那行 `⚡ 本轮 11 tok/s / 3.8s`

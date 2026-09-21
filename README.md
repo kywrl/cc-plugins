@@ -164,10 +164,8 @@ node /path/to/cc-toolkit/plugins/cc-toolkit/scripts/cc-watch.js --once
 
 ## hooks 配置方法
 
-这是本插件的核心。**默认什么都不用配**——插件自带的 `hooks/hooks.json` 会由
-Claude Code 自动加载。只有在下面这种少数情况下才需要手工挂。
-
-### A. 用插件安装 —— 默认就是这条，无需配置
+这是本插件的核心。**装好即生效，什么都不用配**——插件自带的 `hooks/hooks.json`
+会由 Claude Code 自动加载。
 
 插件的 [hooks/hooks.json](plugins/cc-toolkit/hooks/hooks.json) 会被 Claude Code 自动加载，内容就是：
 
@@ -204,93 +202,7 @@ Claude Code 自动加载。只有在下面这种少数情况下才需要手工�
 > Stop hook 的 `decision: "block"` + `reason` 是"阻止 Claude 停下"的控制信号，会把内容喂给模型；
 > `hookSpecificOutput.additionalContext` 同样是给模型的。只有 `systemMessage` 是纯净的用户侧提示。
 
-### B. 手工挂进 settings.json —— 少数情况才需要
-
-**什么时候需要**：插件 hook 没生效时。先确认是不是真的没生效——
-hook 每次执行都会写一份状态缓存 `<临时目录>/cc-toolkit-<会话id>.json`，
-看它的修改时间就知道。
-
-已知会让插件 hook 失效的情况：某些环境下 Claude Code 的 `tengu_plugin_hooks_modules`
-灰度开关为 off（调试日志里写 `installed plugins' hooks modules not loaded`），
-此时「已安装插件的 hook」不会被注册执行。
-
-⚠️ **别照抄调试日志下结论。** 这个开关是**按进程**决定的：`claude -p` 之类的
-CLI 子进程与桌面版长期运行的进程可能状态不同。要判断你的实际环境，
-请在**你真正使用的那个进程**里看 `stop_hook_summary` 记录
-（transcript 里搜这个字段，`hookInfos` 会列出真正执行过的命令）。
-
-**另一种情况**：你已经有别的 Stop hook，想统一管理，都放到 `settings.json` 里。
-
-> ⚠️ 挂完之后**不要两个都留**——插件自带的 `hooks/hooks.json` 和 `settings.json`
-> 里这条会各执行一次，每轮出现**两条**读数。要用这条就先把插件的关掉。
-
-#### B-1. 一条命令搞定（推荐）
-
-装好插件后跑：
-
-```bash
-/cc-toolkit:install-hook
-```
-
-它会自动定位插件安装目录、生成下面的命令、合并进 `~/.claude/settings.json`
-（已有同名 hook 就更新，其他 hook 一律原样保留）。加 `--print` 只预览不落盘，
-加 `--uninstall` 只移除本插件那条。
-
-#### B-2. 手工粘贴
-
-想把配置捏在自己手里，就把下面这段合并进配置文件。注意 `hooks` 是与
-`permissions`、`env` 平级的**顶层字段**：
-
-```json
-{
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"$(ls -d ~/.claude/plugins/cache/*/cc-toolkit/*/scripts/cc-hook.js | head -1)\"",
-            "timeout": 15
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-**为什么长这样，而不是直接写绝对路径？**
-
-两个约束叠在一起：
-
-1. `settings.json` 里的 hook **拿不到** `${CLAUDE_PLUGIN_ROOT}`（实测为 `null`，
-   只有 `CLAUDE_PROJECT_DIR` 可用）——那个变量只在插件自己的 hook 里替换；
-2. 插件的真实路径是 `~/.claude/plugins/cache/<市场名>/cc-toolkit/<版本号>/`，
-   **版本号那段会随插件更新变化**，写死绝对路径升级后就失效。
-
-所以用「命令替换 + 通配符」让 shell 在**运行时**自己找：
-`$(...)` 会执行、`~` 和 `*` 会展开（已实测，Claude Code 的 hook shell 是 Git Bash）。
-外层那对双引号是必需的——它保证即使匹配到多个版本、或路径含空格，
-也只作为**一个**参数传给 node。
-
-外层的双引号还有一个作用：**挂的是插件里的脚本**，插件更新后路径自动跟着变，
-不需要你重配。
-
-> 装在非默认位置？把 `~/.claude` 换成你的路径，或设 `CC_TOOLKIT_PLUGIN_ROOT`
-> 指向插件目录（含 `.claude-plugin/plugin.json` 的那一层）。
-
-> 对路径定位不放心？跑 `/cc-toolkit:tps-doctor`，它会实时解析并打印出
-> 当前定位到的插件目录。
-
-**已经在用 `~/.claude/tps-watch.js --hook`？** 那是本插件的原始独立脚本。如果两个 hook 同时存在，每轮会打印两条读数。
-保留插件版的话，把原来那条删掉再执行 `/hooks` 或重启 Claude Code 让配置生效。
-
-### C. 只挂在特定项目上
-
-把 B 节那段写进 `<项目>/.claude/settings.json`（或用 `/cc-toolkit:install-hook --project`）。
-适合团队统一口径——团队每个人都看到同样的计量方式，讨论速度差异时不容易各说各话。
-
-### 挂上之后怎么验证
+### 怎么验证 hook 生效
 
 1. 让 Claude 回一句有实质内容的话（低于 `CC_TOOLKIT_MIN_TOKENS` 会被跳过，默认 30 tok）；
 2. 回复结束后应看到 `首字 … | 每秒输出 … tok/s | 缓存命中 …%`；
@@ -312,8 +224,7 @@ echo '{"session_id":"t","transcript_path":"/path/to/session.jsonl","hook_event_n
 | --- | --- |
 | `/cc-toolkit:tps [条数]` | 多行快照：当前一轮 + **首字等待/纯解码拆分** + 最近 N 条 + 中位/p90/最快/最慢 + 趋势与离群样本，并附**分层归因**（按 effort / 模型 / 技能 / MCP / 是否带 thinking 分组对比）与会话级事实（缓存命中、API 重试、截断）。参数默认 10，可加 `--all` 回放整个会话文件 |
 | `/cc-toolkit:tps-live [参数]` | 生成实时监视命令（前台长驻，Ctrl-C 退出）。可选 `--interval=500`、`-p 项目目录名` |
-| `/cc-toolkit:tps-doctor` | 环境自检：Node 版本、会话目录、能否定位当前会话、插件路径解析、hook / 状态栏该往哪配 |
-| `/cc-toolkit:install-hook` | 把 Stop hook 写进 `settings.json`（插件 hook 没生效、或想统一管理 hook 时用）。`--print` 预览、`--uninstall` 移除、`--project` 写进当前项目 |
+| `/cc-toolkit:tps-doctor` | 环境自检：Node 版本、会话目录、能否定位当前会话、hook / 状态栏该往哪配 |
 
 命令行等价形式（不装插件也能用）：
 
@@ -562,7 +473,7 @@ echo '{"session_id":"t","transcript_path":"C:/Users/me/.claude/projects/项目�
 ```
 
 5. 确认没被环境变量关掉：`CC_TOOLKIT_DISABLE` / `CC_TOOLKIT_MIN_TOKENS`；
-6. 还是不行 → 按 [hooks 配置方法](#hooks-配置方法) B 节手工挂进 `settings.json`。
+6. 还是不行 → 按 [怎么验证 hook 生效](#怎么验证-hook-生效) 确认插件 hook 有没有被加载。
 
 **Q: 回复很短（比如只回一句"你好"）时没有读数？**
 
@@ -590,12 +501,11 @@ CLI 子进程与桌面版可能不同。
 
 **Q: 插件更新后 hook 失效了？**
 
-不该发生——`settings.json` 里那条命令用的是通配符，会自己跟随版本号。
-如果确实失效，跑 `/cc-toolkit:install-hook` 重新生成一条。想确认当前解析结果：
+不该发生。插件自带的 `hooks/hooks.json` 里写的是
+`node "${CLAUDE_PLUGIN_ROOT}/scripts/cc-hook.js"`，`${CLAUDE_PLUGIN_ROOT}`
+由 Claude Code 在运行时替换成**当前版本**的安装目录，所以版本号变化跟它无关。
 
-```bash
-node ~/.claude/plugins/cache/*/cc-toolkit/*/scripts/cc-resolve.js --print
-```
+如果确实失效，先按上一节确认 `stop_hook_summary` 里到底执行了什么。
 
 **Q: 数字显示 `0 tok/s` 或一直 "… 等待响应"**
 
@@ -607,9 +517,13 @@ node ~/.claude/plugins/cache/*/cc-toolkit/*/scripts/cc-resolve.js --print
 
 **Q: 每轮出现两条读数**
 
-除了插件，还有另一个 Stop hook 在跑（例如你原来手工配的 `~/.claude/tps-watch.js --hook`）。
-用 `/cc-toolkit:install-hook --print` 可以看出当前 `settings.json` 里有没有额外那条，
-留一个、删掉另一个，然后重启 Claude Code。
+除插件外还有另一个 Stop hook 在跑。**最常见的是早期版本的工具往 `settings.json`
+里写过一条**（那个命令已在 2.0.5 移除，改用插件自带 hook）——两者各执行一次，
+于是每轮两条。
+
+打开 `~/.claude/settings.json`，`hooks.Stop` 里凡是命令含 `cc-hook.js` 的都删掉；
+你手工配的其他脚本（如 `~/.claude/tps-watch.js --hook`）也一并检查，只留一个。
+改完重启 Claude Code。
 
 **Q: 数字忽高忽低**
 
@@ -637,18 +551,15 @@ cc-plugins/                             # 仓库名 = 市场名
 │       ├── commands/
 │       │   ├── tps.md                # /cc-toolkit:tps
 │       │   ├── tps-live.md           # /cc-toolkit:tps-live
-│       │   ├── tps-doctor.md         # /cc-toolkit:tps-doctor
-│       │   └── install-hook.md       # /cc-toolkit:install-hook
+│       │   └── tps-doctor.md         # /cc-toolkit:tps-doctor
 │       ├── scripts/
 │       │   ├── cc-core.js            # 计算引擎：日志解析 / 轮次归档 / tok-s 统计 / 渲染
 │       │   ├── cc-watch.js           # CLI：实时 / --once / --report / --json
 │       │   ├── cc-hook.js            # Stop hook：回吐 systemMessage + 写状态栏缓存
 │       │   ├── cc-statusline.js      # 状态栏：读缓存，输出单行读数
-│       │   ├── cc-resolve.js         # 定位已安装插件的脚本目录（跨版本）
-│       │   ├── cc-install-hook.js    # 把 Stop hook 写进 settings.json
 │       │   └── cc-doctor.js          # 环境自检
 │       ├── tests/
-│       │   └── cc-toolkit.test.js    # 39 个测试，Node 内置测试运行器，零依赖
+│       │   └── cc-toolkit.test.js    # 86 个测试，Node 内置测试运行器，零依赖
 │       └── LICENSE
 ├── LICENSE
 └── README.md

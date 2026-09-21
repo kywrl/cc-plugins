@@ -110,30 +110,8 @@ say(`${OK} Stop hook  : node "${path.join(__dirname, "cc-hook.js")}"`);
 say("   → 由插件的 hooks/hooks.json 自动挂载，无需手工配置。");
 say("     · 每轮回复后显示首字等待 / 每秒输出 / 缓存命中");
 say("");
-say("   ⚠ 用第三方 ANTHROPIC_BASE_URL 时，Claude Code 会关掉 GrowthBook，");
-say("     而 tengu_plugin_hooks_modules（已安装插件的 hook 开关）默认 off，");
-say("     插件自带的 hook 不会被执行。此时改用其中一种方式挂载：");
-say("       · /cc-toolkit:install-hook        （自动写入 settings.json，推荐）");
-say("       · 手工写进 settings.json          （片段见 README「hooks 配置方法」B 节）");
-say("     两种方式挂的都是插件里的脚本，不是本地脚本。");
-say("");
-
-// ⑥b 路径定位能力（settings.json 挂载方式依赖它）
-const { execFileSync } = require("child_process");
-let resolvedOk = false;
-try {
-  const out = execFileSync(process.execPath, [path.join(__dirname, "cc-resolve.js"), "--print"], {
-    encoding: "utf8",
-    timeout: 10000,
-  }).trim();
-  resolvedOk = true;
-  say(`${OK} 插件路径定位: ${out}`);
-  say("   → settings.json 挂载方式靠它解析路径（跟随插件更新换版本号）。");
-} catch (err) {
-  say(`${WARN} 插件路径定位失败`);
-  const msg = String((err && err.stderr) || (err && err.message) || "");
-  for (const line of msg.split("\n").slice(0, 8)) if (line.trim()) say("   " + line.trim());
-}
+say("   没生效？先确认它到底跑没跑：在会话文件里搜 stop_hook_summary，");
+say("   hookInfos 会列出真正执行过的命令。");
 say("");
 say(`${OK} 状态栏(可选): node "${path.join(__dirname, "cc-statusline.js")}"`);
 say("   → 需手工写进 settings.json 的 statusLine；粘贴即用的片段见 README。");
