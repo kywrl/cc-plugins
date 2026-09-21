@@ -20,9 +20,9 @@
  *   CC_TOOLKIT_SHOW=            控制行里包含哪些字段，逗号分隔
  *                               默认 "steps,decode,cache"
  *                               可选 steps(本轮步数) decode(每秒输出/纯解码)
- *                                    cache(缓存命中) tps(整轮速度) ttft(首块等待)
- *                                    median(近期中位) tokens(本轮 token 数)
- *                                    thinking(思维链占比) model effort skill
+ *                                    cache(缓存命中) tps(整轮速度)
+ *                                    tokens(本轮 token 数) thinking(思维链占比)
+ *                                    model effort skill
  *   CC_TOOLKIT_ALERTS=1         打开截断 / refusal / API 重试的额外提示
  */
 
@@ -53,7 +53,7 @@ const silent = (reason) => {
  * 缺一段会让「这一行有几个数」在每轮之间跳变，读者得先数一遍才知道少了什么；
  * 固定三格则一眼能看出「哪个数没测到」。
  */
-function composeMessage(round, rollup, opts) {
+function composeMessage(round, opts) {
   const { show } = opts;
   // 估算标记按字段独立判断：哪个数字来自字符估算，就在哪个前面加 ≈。
   // 整行共用一个标记会让人误以为三个数都是估的。
@@ -65,13 +65,6 @@ function composeMessage(round, rollup, opts) {
   // 步数来自 message.id 个数，没有估算与精确之分，不参与 ≈ 标记。
   if (show.has("steps")) {
     bits.push(round.calls >= 1 ? `${round.calls} 步` : "步数 —");
-  }
-  // ttft 不在默认三格里。它测的是「真人输入 → 首个内容块落盘」，含首块生成时间，
-  // 首块大小在一轮之间差几十倍，跨轮次比较会误导 —— 要看得显式加进 CC_TOOLKIT_SHOW。
-  if (show.has("ttft")) {
-    bits.push(
-      round.ttftMs != null ? `首块 ${mark("ttft")}${(round.ttftMs / 1000).toFixed(1)}s` : "首块 —"
-    );
   }
   // decodeTps 已有可测区间时才报；测不出就诚实占位，不拿含 prefill / 工具时间的数冒充
   if (show.has("decode")) {
@@ -107,13 +100,7 @@ function composeMessage(round, rollup, opts) {
   if (show.has("effort") && round.effort) bits.push(`effort=${round.effort}`);
   if (show.has("skill") && round.skill) bits.push(`skill=${round.skill}`);
 
-  let msg = bits.join(" | ");
-
-  const med = rollup ? rollup.median : null;
-  if (show.has("median") && med != null && rollup.count) {
-    msg += `${msg ? " | " : ""}近${rollup.count}条中位 ${med.toFixed(0)} tok/s`;
-  }
-  return msg;
+  return bits.join(" | ");
 }
 
 /**
@@ -122,7 +109,6 @@ function composeMessage(round, rollup, opts) {
  */
 function hasAnyRealReading(round, show) {
   if (show.has("steps") && round.calls >= 1) return true;
-  if (show.has("ttft") && round.ttftMs != null) return true;
   if (show.has("decode") && round.decodeTps > 0) return true;
   if (show.has("cache") && round.cache) return true;
   if (show.has("tps") && round.durMs > 0) return true;
@@ -196,18 +182,13 @@ async function main() {
   });
 
   // 取本轮读数：latestRound 给的是「用户视角的一轮」（你发消息 → 回复结束），
-  // 不走统计过滤器 —— 否则短回复会被 MIN_SAMPLE_TOKENS=50 吃掉，
-  // 用户设的 CC_TOOLKIT_MIN_TOKENS 就形同虚设。
-  const round = tracker.latestRound({ force: true });
+  // 也是唯一的读数入口。是否报告由下面 CC_TOOLKIT_MIN_TOKENS 一处决定。
+  const round = tracker.latestRound();
   if (!round) return silent("没有可报告的轮次");
 
   if (round.tokens < minTokens) {
     return silent(`样本太小 (${Math.round(round.tokens)} < ${minTokens} tok)`);
   }
-
-  // 聚合量：中位数等只在用户把 median 加进 CC_TOOLKIT_SHOW 时才需要
-  const samples = show.has("median") ? tracker.recentSamples(undefined, { force: true }) : [];
-  const rollup = tracker.rollup(samples);
 
   const alerts = [];
 
@@ -226,7 +207,7 @@ async function main() {
     }
   }
 
-  let msg = composeMessage(round, rollup, { show });
+  let msg = composeMessage(round, { show });
   if (alerts.length) msg += (msg ? "\n" : "") + alerts.join("\n");
 
   // 三格全是 — 时（连 token 都没有的极短回复）没有可展示的内容，

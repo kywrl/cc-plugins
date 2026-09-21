@@ -10,7 +10,7 @@
     {
       "name": "cc-toolkit",
       "source": "./plugins/cc-toolkit",
-      "description": "实时监控 Claude Code 的输出速度 (tok/s)，并把纯解码速度与整轮速度分开报 —— 合成一个数字时 prompt 变长会被误读成模型变慢。每轮回复结束后显示本轮步数 / 每秒输出 / 缓存命中三个读数，提供 /cc-toolkit:tps 查看历史分布、趋势与分层归因（按 effort / 模型 / 技能 / MCP 对比）。零 npm 依赖，全部数据在本地计算。",
+      "description": "实时监控 Claude Code 的输出速度 (tok/s)，并把纯解码速度与整轮速度分开报 —— 合成一个数字时 prompt 变长会被误读成模型变慢。每轮回复结束后显示本轮步数 / 每秒输出 / 缓存命中三个读数 —— 装好即生效，无斜杠命令、无 CLI。零 npm 依赖，全部数据在本地计算。",
       "category": "monitoring",
       "homepage": "https://github.com/kywrl/cc-plugins/tree/main/plugins/cc-toolkit"
     }

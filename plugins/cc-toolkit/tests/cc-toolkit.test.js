@@ -188,11 +188,10 @@ test("projectDirFor: 非字母数字一律换成连字符", () => {
   assert.equal(core.projectDirFor("/home/u/my_app"), "-home-u-my-app");
 });
 
-test("median / percentile: 奇偶长度都正确", () => {
+test("median: 奇偶长度都正确", () => {
   assert.equal(core.median([]), null);
   assert.equal(core.median([1, 2, 3]), 2);
   assert.equal(core.median([1, 2, 3, 4]), 2.5);
-  assert.equal(core.percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90), 9);
 });
 
 test("SessionTracker: 一轮里的多步被聚合成一个整体", () => {
@@ -315,68 +314,35 @@ test("SessionTracker: 工具结果与技能注入不作为轮次锚点", () => {
 test("SessionTracker: 用 usage 精确值计算 tok/s", () => {
   // 一轮：400 token，耗时 2000ms → 200 tok/s
   const file = writeTranscript([{ id: "msg_a", ms: 2000, tokens: 400, chunks: 4 }]);
-  const tracker = new core.SessionTracker(file).start();
+  const r = new core.SessionTracker(file).start().latestRound();
 
-  // 最后一轮还没归档，要靠收尾才进入统计视图
-  assert.equal(tracker.samples.length, 0, "未收尾时最后一轮不应出现在已归档样本里");
-  const rows = tracker.recentSamples();
-  assert.equal(rows.length, 1, "收尾后最后一轮应出现在统计视图里");
-
-  const s = tracker.stats();
-  assert.equal(s.count, 1);
-  // 样本的 tokens 必须来自 usage.output_tokens，而不是字符估算
-  assert.equal(rows[0].tokens, 400);
-  assert.equal(rows[0].estimated, false);
-  assert.equal(rows[0].durMs, 2000);
-  assert.equal(Math.round(rows[0].tps), 200);
-  // 收尾视图不应改变 tracker 内部状态
-  assert.equal(tracker.samples.length, 0, "finalizedSamples 不应有副作用");
+  // tokens 必须来自 usage.output_tokens，而不是字符估算
+  assert.equal(r.tokens, 400);
+  assert.equal(r.estimated, false);
+  assert.equal(r.durMs, 2000);
+  assert.equal(Math.round(r.tps), 200);
 });
 
-test("SessionTracker: 已结束的当前轮会被自动收尾（不必等下一轮）", async () => {
-  const file = writeTranscript([{ id: "msg_only", ms: 2000, tokens: 400 }]);
-  const tracker = new core.SessionTracker(file).start();
-  assert.equal(tracker.samples.length, 0);
-
-  // 等过 3 秒的流式窗口后，视为已结束
-  await new Promise((r) => setTimeout(r, core.STREAMING_WINDOW_MS + 200));
-  assert.equal(tracker.recentSamples().length, 1, "超过流式窗口后应自动纳入样本");
-  // 但 currentSpeed 仍然能报出「最近一轮」
-  assert.ok(tracker.currentSpeed(), "收尾不应让 currentSpeed 失效");
-});
-
-test("SessionTracker: 小样本与短响应被过滤掉", () => {
-  const file = writeTranscript([
-    { id: "msg_small", ms: 2000, tokens: 10 }, // token 太少
-    { id: "msg_fast", ms: 100, tokens: 500 }, // 太快
-    { id: "msg_ok", ms: 2000, tokens: 500 }, // 合格
-  ]);
-  const tracker = new core.SessionTracker(file).start();
-  // msg_small / msg_fast 在遇到下一轮时就被归档并过滤，msg_ok 靠收尾进入视图
-  const rows = tracker.recentSamples();
-  assert.equal(rows.length, 1);
-  assert.equal(Math.round(rows[0].tps), 250);
-});
-
-test("SessionTracker: 新 message.id 出现时归档上一轮", () => {
+test("SessionTracker: 新 message.id 出现时归档上一步", () => {
   const file = writeTranscript([
     { id: "msg_1", ms: 2000, tokens: 400 },
     { id: "msg_2", ms: 1000, tokens: 300 },
   ]);
   const tracker = new core.SessionTracker(file).start();
-  assert.equal(tracker.samples.length, 1, "msg_1 遇到 msg_2 时被归档");
-  assert.equal(tracker.currentId, "msg_2");
-  assert.equal(tracker.recentSamples().length, 2, "msg_2 靠收尾进入统计视图");
+
+  assert.equal(tracker.currentId, "msg_2", "当前步应换成新的 message.id");
+  assert.ok(!tracker.groups.has("msg_1"), "上一步该从 groups 里归档掉，不再重复累计");
+  assert.equal(tracker.latestRound().tokens, 300, "读数给的是最新那一轮");
 });
 
 test("SessionTracker: 没等到 usage 时用字符数估算，并标记 estimated", () => {
   const file = writeTranscript([{ id: "msg_est", ms: 2000, tokens: 400, usage: false, chunks: 4 }]);
-  const tracker = new core.SessionTracker(file).start();
-  const snap = tracker.currentSpeed();
+  const r = new core.SessionTracker(file).start().latestRound();
 
-  assert.ok(snap, "应该有进行中的响应");
-  assert.equal(snap.estimated, true, "usage 未落盘 → 必须标记为估算");
-  assert.ok(snap.tokens > 0);
+  assert.ok(r, "usage 没落盘也要给读数，只是标成估算");
+  assert.equal(r.estimated, true, "usage 未落盘 → 必须标记为估算");
+  assert.ok(r.tokens > 0);
+  assert.equal(r.estimatedFields.decode, true, "decode 用到估算值 → 该字段要带 ≈");
 });
 
 test("SessionTracker: 忽略子代理(isSidechain)的输出", () => {
@@ -397,19 +363,15 @@ test("SessionTracker: 忽略子代理(isSidechain)的输出", () => {
     }) + "\n";
   fs.appendFileSync(file, extra, "utf8");
 
-  const tracker = new core.SessionTracker(file).start();
-  const rows = tracker.recentSamples();
-  assert.equal(rows.length, 2, "子代理那轮不应变成样本");
-  assert.equal(rows[0].tokens, 400);
-  assert.equal(rows[1].tokens, 300);
-  assert.ok(!rows.some((d) => d.tokens === 9999), "子代理的 9999 token 不应混入");
+  const r = new core.SessionTracker(file).start().latestRound();
+  assert.equal(r.tokens, 300, "子代理那一行不该顶替主会话的读数");
+  assert.notEqual(r.tokens, 9999);
 });
 
 test("SessionTracker: 增量 pump 只消费新增字节，不重复计数", () => {
   const file = writeTranscript([{ id: "msg_1", ms: 2000, tokens: 400 }]);
   const tracker = new core.SessionTracker(file).start();
-  assert.equal(tracker.samples.length, 0, "读完后最后一轮尚未归档");
-  assert.equal(tracker.recentSamples().length, 1);
+  assert.equal(tracker.latestRound().tokens, 400);
 
   // 追加第二轮
   const t = Date.parse("2026-01-01T01:00:00Z");
@@ -431,12 +393,12 @@ test("SessionTracker: 增量 pump 只消费新增字节，不重复计数", () =
   );
 
   tracker.pump();
-  assert.equal(tracker.samples.length, 1, "msg_1 应被 msg_2 归档");
-  assert.equal(tracker.samples[0].tokens, 400, "重复 pump 不应把已有内容再算一遍");
+  assert.ok(!tracker.groups.has("msg_1"), "msg_1 应被 msg_2 归档");
+  assert.equal(tracker.latestRound().tokens, 300, "重复 pump 不该把已有内容再算一遍");
 
   tracker.pump(); // 幂等
-  assert.equal(tracker.samples.length, 1);
-  assert.equal(tracker.recentSamples().length, 2, "msg_2 靠收尾进入统计视图");
+  assert.equal(tracker.latestRound().tokens, 300);
+  assert.equal(tracker.currentSteps.length, 1, "本轮只有一步");
 });
 
 test("SessionTracker: 不完整的一行会被留到下次读取", () => {
@@ -461,20 +423,6 @@ test("SessionTracker: 不完整的一行会被留到下次读取", () => {
   assert.ok(tracker.groups.has("msg_3"), "补全后的行应被正确解析");
 });
 
-test("analyze: 给出趋势、离群与估算占比", () => {
-  const rounds = [];
-  for (let i = 0; i < 12; i++) rounds.push({ id: `slow_${i}`, ms: 4000, tokens: 200 }); // 50 tok/s
-  for (let i = 0; i < 12; i++) rounds.push({ id: `fast_${i}`, ms: 1000, tokens: 400 }); // 400 tok/s
-  const file = writeTranscript(rounds);
-
-  const a = core.analyze(new core.SessionTracker(file).start());
-  assert.equal(a.sampleCount, 24);
-  assert.ok(a.recent.median > a.earlier.median, "后半段更快");
-  assert.ok(a.trendPct > 0, "趋势应为正（变快）");
-  assert.ok(a.outliers.length > 0, "应识别出偏慢的离群样本");
-  assert.equal(a.estimatedShare, 0, "全都有 usage，估算占比为 0");
-});
-
 test("listSessions / pickSessionFile: 按项目目录名与 cwd 过滤", () => {
   const projectsDir = fs.mkdtempSync(path.join(tmpRoot, "projects-"));
   const projDir = path.join(projectsDir, "D--workspace-demo");
@@ -495,33 +443,14 @@ test("listSessions / pickSessionFile: 按项目目录名与 cwd 过滤", () => {
   assert.equal(core.listSessions({ projectsDir, project: "nonexistent" }).length, 0);
 });
 
-test("SessionTracker: 短回复不进统计样本，但仍能被 latestRound 读到", () => {
-  // 回归测试：曾经统计过滤器（MIN_SAMPLE_TOKENS=50）会把短轮次整个丢掉，
+test("SessionTracker: latestRound 不套统计下限，短回复照样读得到", () => {
+  // 回归测试：曾经的统计过滤器（MIN_SAMPLE_TOKENS=50）会把短轮次整个丢掉，
   // 导致 hook 取不到本轮读数 —— 用户设的 CC_TOOLKIT_MIN_TOKENS 形同虚设。
-  const file = writeTranscript([
-    { id: "short_1", ms: 2400, tokens: 46 }, // 「你好」量级：< 50，会被归档
-    { id: "short_2", ms: 2000, tokens: 400 }, // 触发对 short_1 的归档，自己留作当前轮
-  ]);
-  const tracker = new core.SessionTracker(file).start();
-
-  // short_1 已被归档，但太小 → 不进统计样本；short_2 还是当前轮，尚未归档
-  assert.equal(tracker.samples.length, 0, "46 token 的轮次不该进统计样本");
-
-  // 但 latestRound 必须能拿到最新一轮（当前轮 short_2）
-  const r = tracker.latestRound({ force: true });
-  assert.ok(r, "latestRound 必须返回最新一轮");
-  assert.equal(r.tokens, 400);
-});
-
-test("SessionTracker: latestRound 在会话只有一条短回复时也能返回它", () => {
+  // 3.0.0 删掉了整条统计链路，这条守卫改成盯住「latestRound 不看任何下限」。
   const file = writeTranscript([{ id: "only", ms: 2400, tokens: 46 }]);
-  const tracker = new core.SessionTracker(file).start();
+  const r = new core.SessionTracker(file).start().latestRound();
 
-  assert.equal(tracker.samples.length, 0, "短轮次不进统计样本");
-  assert.equal(tracker.recentSamples(undefined, { force: true }).length, 0, "统计视图也为空");
-
-  const r = tracker.latestRound({ force: true });
-  assert.ok(r, "即便统计视图为空，本轮读数也必须拿得到");
+  assert.ok(r, "哪怕只有 46 token，本轮读数也必须拿得到");
   assert.equal(r.tokens, 46);
   assert.equal(r.durMs, 2400);
   assert.equal(Math.round(r.tps), 19);
@@ -533,26 +462,6 @@ test("SessionTracker: latestRound 丢弃无 token 或零耗时的轮次", () => 
   const tracker = new core.SessionTracker(file).start();
   const r = tracker.latestRound({ force: true });
   assert.equal(r, null, "token 不足 1 的轮次没有可报告的速度");
-});
-
-test("SessionTracker: 已归档的短轮次也会被 lastRound 记住", () => {
-  // 短轮次归档时该记进 lastRound；之后每归档一轮就覆盖它。
-  const file = writeTranscript([
-    { id: "short", ms: 2400, tokens: 46 }, // 归档（太小，不进样本）
-    { id: "big", ms: 2000, tokens: 400 }, // 归档（进样本），覆盖 lastRound
-    { id: "big2", ms: 2000, tokens: 500 }, // 当前轮，未归档
-  ]);
-  const tracker = new core.SessionTracker(file).start();
-
-  assert.equal(tracker.lastRound.tokens, 400, "lastRound 应指向最新归档的那条");
-  assert.deepEqual(
-    tracker.samples.map((d) => d.tokens),
-    [400],
-    "统计样本只收够大的 big"
-  );
-
-  // 当前轮（big2）优先于 lastRound
-  assert.equal(tracker.latestRound({ force: true }).tokens, 500);
 });
 
 test("hook: 短回复（低于统计下限但高于 CC_TOOLKIT_MIN_TOKENS）仍会报告", () => {
@@ -625,7 +534,6 @@ test("hook: CC_TOOLKIT_SHOW 能裁剪输出行", () => {
   assert.doesNotMatch(msg, /步/, "步数不在 show 里就不该出现");
   assert.doesNotMatch(msg, /每秒输出/, "每秒输出不在 show 里就不该出现");
   assert.doesNotMatch(msg, /缓存命中/, "缓存不在 show 里就不该出现");
-  assert.doesNotMatch(msg, /近\d+条中位/, "median 不在 show 里就不该出现");
 });
 
 test("hook: max_tokens 截断时给出告警", () => {
@@ -877,69 +785,6 @@ test("SessionTracker: 回放窗口切断起点锚时，整轮速度算不出来"
   assert.equal(Math.round(ok.tps), 67, "整轮 6s / 400 tok");
 });
 
-test("SessionTracker: 锚点被切断的轮次不进统计聚合", () => {
-  // 它的 tps 分母少了一段起点，混进中位数会系统性偏高。
-  // 让被切断的那一轮**归档**（后面再出现新的 message.id），它才会走到样本过滤器 ——
-  // 否则它只是「当前轮」，测不到这条过滤。
-  const dir = fs.mkdtempSync(path.join(tmpRoot, "anchanchor-"));
-  const file = path.join(dir, "aa.jsonl");
-  const t0 = Date.parse("2026-01-01T00:00:00Z");
-  const rows = [];
-  const push = (ts, id, usage) =>
-    rows.push(
-      JSON.stringify({
-        type: "assistant",
-        timestamp: new Date(ts).toISOString(),
-        message: { id, role: "assistant", content: [{ type: "text", text: "x".repeat(400) }], usage },
-      })
-    );
-
-  // 第一轮：用户行 + 3 块，整轮正常
-  rows.push(JSON.stringify({ type: "user", timestamp: new Date(t0).toISOString(), message: { role: "user", content: "p" } }));
-  push(t0 + 800, "msg_a", undefined);
-  push(t0 + 1600, "msg_a", undefined);
-  push(t0 + 2400, "msg_a", { output_tokens: 400 });
-
-  // 第二轮：这一轮的用户行会被切掉
-  const userLine = JSON.stringify({
-    type: "user",
-    timestamp: new Date(t0 + 5000).toISOString(),
-    message: { role: "user", content: "p" },
-  });
-  rows.push(userLine);
-  push(t0 + 10000, "msg_b", undefined);
-  push(t0 + 11000, "msg_b", undefined);
-  push(t0 + 12000, "msg_b", { output_tokens: 400 });
-
-  // 第三轮：只为把 msg_b 挤成「已归档」
-  rows.push(JSON.stringify({ type: "user", timestamp: new Date(t0 + 20000).toISOString(), message: { role: "user", content: "p" } }));
-  push(t0 + 20800, "msg_c", undefined);
-  push(t0 + 21600, "msg_c", undefined);
-  push(t0 + 22400, "msg_c", { output_tokens: 400 });
-
-  const body = rows.join("\n") + "\n";
-  fs.writeFileSync(file, body, "utf8");
-
-  // 切在第二轮的用户行内部 → msg_b 的锚点丢失，msg_a 完整保留
-  const size = Buffer.byteLength(body, "utf8");
-  const userStart = Buffer.byteLength(rows.slice(0, 4).join("\n"), "utf8") + 1;
-  const tracker = new core.SessionTracker(file).start({ replayTailBytes: size - (userStart + 20) });
-
-  const samples = tracker.recentSamples(undefined, { force: true });
-  assert.ok(samples.length > 0, "前面那几轮仍在窗口内，样本不该是空的");
-
-  const polluted = samples.filter((d) => d.truncatedAnchor);
-  assert.deepEqual(
-    polluted.map((d) => Math.round(d.tps)),
-    [],
-    "锚点被切断的轮次不该出现在统计样本里（它的 tps 分母是错的）"
-  );
-
-  // 但它仍要能作为「最新一轮」被读到（只不过整轮耗时算不出来）
-  const latest = tracker.latestRound({ force: true });
-  assert.ok(latest, "被切断锚点的那一轮仍要能读到");
-});
-
 test("SessionTracker: 解析 thinking token 数与占比", () => {
   const file = patchUsage(
     writeTranscript([{ id: "m", ms: 2000, tokens: 400, chunks: 2 }]),
@@ -1038,7 +883,9 @@ test("SessionTracker: max_tokens 截断与 refusal 被标记", () => {
   assert.equal(mk("end_turn", "et.jsonl").stoppedByLimit, false);
 });
 
-test("SessionTracker: 解析 system 行的 api_error / turn_duration / hook 摘要", () => {
+test("SessionTracker: 解析 system 行的 api_error", () => {
+  // 3.0.0 起旁路事件只剩 api_error —— hook 用它提示「本轮期间有过重试」。
+  // turn_duration / stop_hook_summary 的消费者是已删掉的会话级事实，不再解析。
   const file = writeTranscript([{ id: "m", ms: 2000, tokens: 400 }]);
   fs.appendFileSync(
     file,
@@ -1074,164 +921,21 @@ test("SessionTracker: 解析 system 行的 api_error / turn_duration / hook 摘�
   );
 
   const t = new core.SessionTracker(file).start();
-  const f = t.sessionFacts();
-  assert.equal(f.apiErrors.count, 1);
-  assert.equal(f.apiErrors.byCode[0].code, "ECONNRESET");
-  assert.equal(f.apiErrors.retried, 1);
-  assert.equal(f.turnDurations.count, 1);
-  assert.equal(f.turnDurations.medianMs, 6373);
-  assert.equal(f.hookRuns.count, 1);
-  assert.equal(f.hookRuns.withOutput, 1);
-  assert.equal(f.hookRuns.withErrors, 0);
+  assert.equal(t.apiErrors.length, 1);
+  assert.equal(t.apiErrors[0].code, "ECONNRESET");
+  assert.equal(t.apiErrors[0].retryAttempt, 2);
+  assert.equal(t.apiErrors[0].source, "request_retry");
+  assert.equal(t.turnDurations, undefined, "turn_duration 不再解析（消费者已删）");
+  assert.equal(t.hookRuns, undefined, "stop_hook_summary 不再解析（消费者已删）");
 });
 
-test("SessionTracker: 分层对比按 effort / 技能 / 工具调用切分", () => {
-  const rounds = [];
-  for (let i = 0; i < 4; i++) rounds.push({ id: `hi_${i}`, ms: 1000, tokens: 400 }); // 400 tok/s
-  for (let i = 0; i < 4; i++) rounds.push({ id: `lo_${i}`, ms: 4000, tokens: 400 }); // 100 tok/s
-  const file = writeTranscript(rounds, { name: "breakdown.jsonl" });
-
-  const rows = fs
-    .readFileSync(file, "utf8")
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => JSON.parse(l));
-  fs.writeFileSync(
-    file,
-    rows
-      .map((r) => {
-        if (r.type !== "assistant") return JSON.stringify(r);
-        const fast = r.message.id.startsWith("hi_");
-        r.effort = fast ? "low" : "xhigh";
-        r.attributionSkill = fast ? "quick-fix" : "deep-review";
-        // 慢的那些轮次带一个 tool_use 块
-        if (!fast) r.message.content = [...r.message.content, { type: "tool_use", id: "t1", name: "Bash", input: {} }];
-        return JSON.stringify(r);
-      })
-      .join("\n") + "\n",
-    "utf8"
-  );
-
-  const b = new core.SessionTracker(file).start().breakdown();
-  const low = b.byDifficulty.find((g) => g.key === "low");
-  const xhigh = b.byDifficulty.find((g) => g.key === "xhigh");
-  assert.equal(low.count, 4);
-  assert.equal(xhigh.count, 4);
-  assert.ok(low.medianTps > xhigh.medianTps, "low 档应明显更快");
-  assert.ok(b.bySkill.find((g) => g.key === "deep-review"), "应按技能分组");
-  assert.ok(b.byToolUse.find((g) => g.key === "含工具调用"), "应能区分是否调用工具");
-
-  // 样本量 <3 的分组应被过滤掉，避免过度解读
-  const plain = writeTranscript(
-    Array.from({ length: 4 }, (_, i) => ({ id: `p_${i}`, ms: 2000, tokens: 400 })),
-    { name: "thin-groups.jsonl" }
-  );
-  const thin = new core.SessionTracker(plain).start().breakdown();
-  assert.equal(thin.byDifficulty.length, 0, "没有 effort 字段就没有分组");
-  assert.equal(thin.bySkill.length, 0, "没有技能归因就没有分组");
-});
-
-test("analyze: 提供分层、会话事实与双口径趋势", () => {
-  const rounds = [];
-  for (let i = 0; i < 22; i++) rounds.push({ id: `m_${i}`, ms: 2000, tokens: 400, chunks: 3 });
-  const a = core.analyze(new core.SessionTracker(writeTranscript(rounds)).start());
-
-  assert.ok(a.breakdown, "应给出分层结果");
-  assert.ok(a.session, "应给出会话级事实");
-  assert.equal(typeof a.session.cache.sampleCount, "number");
-  assert.ok("decodeTrendPct" in a, "应提供纯解码口径的趋势");
-});
-
-// ── 端到端：CLI ─────────────────────────────────────────────────────────
-
-test("CLI --report: 输出含表头、样本行与统计事实", () => {
-  const file = writeTranscript([
-    { id: "msg_1", ms: 2000, tokens: 400 },
-    { id: "msg_2", ms: 1000, tokens: 500 },
-  ]);
-  const out = run("cc-watch.js", ["--report", "--history=5", file]);
-
-  assert.match(out, /会话 \w+/);
-  assert.match(out, /最近 2 条已完成的响应/);
-  assert.match(out, /中位 \d+ tok\/s/);
-  assert.match(out, /── 统计事实 ──/);
-  assert.doesNotMatch(out, /\x1b\[/, "报告不应含 ANSI 色码");
-});
-
-test("CLI --json: 是合法 JSON，且字段齐全", () => {
-  const file = writeTranscript([{ id: "msg_1", ms: 2000, tokens: 400 }]);
-  const data = JSON.parse(run("cc-watch.js", ["--json", "--history=5", file]));
-
-  assert.equal(data.samples.length, 1);
-  assert.equal(data.samples[0].tokens, 400);
-  assert.equal(data.samples[0].estimated, false);
-  assert.equal(typeof data.stats.median, "number");
-  assert.equal(data.stats.trendPct, undefined, "趋势不再放在 stats 里");
-  assert.equal(data.trendPct, null, "单样本无法判断趋势");
-});
-
-test("CLI --json: 带上分层指标与会话级事实", () => {
-  // 造够样本量，让每个 effort 分组都能过 n>=3 的阈值
-  const rounds = Array.from({ length: 4 }, (_, i) => ({ id: `m${i}`, ms: 2000, tokens: 400, chunks: 3 }));
-  const file = writeTranscript(rounds, { name: "json-insights.jsonl" });
-
-  patchUsage(file, {
-    input_tokens: 1000,
-    cache_read_input_tokens: 9000,
-    cache_creation_input_tokens: 0,
-  });
-  patchAssistant(file, { effort: "high" });
-  patchLines(file, (r) => {
-    if (r.type !== "assistant") return r;
-    r.message.model = "claude-opus-5";
-    r.message.stop_reason = "end_turn";
-    return r;
-  });
-
-  const data = JSON.parse(run("cc-watch.js", ["--json", "--history=5", file]));
-  const eff = data.breakdown.byEffort.find((g) => g.key === "high");
-  assert.ok(eff, "应按 effort 分组");
-  assert.equal(eff.count, 4);
-
-  assert.equal(data.samples[0].cacheHitRatio, 0.9, "缓存命中率应被解析出来（9000/10000）");
-  assert.equal(data.sessionFacts.cache.sampleCount, 4);
-  assert.equal(data.sessionFacts.anomalies.maxTokens, 0);
-});
-
-test("CLI --insights: 输出分层对比与会话级事实，且无色码", () => {
-  const rounds = [];
-  for (let i = 0; i < 4; i++) rounds.push({ id: `hi_${i}`, ms: 1000, tokens: 400, chunks: 3 });
-  for (let i = 0; i < 4; i++) rounds.push({ id: `lo_${i}`, ms: 4000, tokens: 400, chunks: 3 });
-  const file = writeTranscript(rounds, { name: "insights.jsonl" });
-
-  patchLines(file, (r) => {
-    if (r.type !== "assistant") return r;
-    r.effort = r.message.id.startsWith("hi_") ? "low" : "xhigh";
-    r.message.usage = { ...r.message.usage, input_tokens: 1000, cache_read_input_tokens: 9000 };
-    return r;
-  });
-
-  const out = run("cc-watch.js", ["--insights", file]);
-  assert.match(out, /── 指标分层 ──/);
-  assert.match(out, /按 effort 档位/);
-  assert.match(out, /── 会话级事实 ──/);
-  assert.match(out, /缓存: /);
-  assert.match(out, /low /, "应出现 low 档分组");
-  assert.doesNotMatch(out, /\x1b\[/, "报告不应含 ANSI 色码");
-});
-
-test("CLI --once: 单行输出", () => {
-  const file = writeTranscript([{ id: "msg_1", ms: 2000, tokens: 400 }]);
-  const out = run("cc-watch.js", ["--once", file]);
-  assert.equal(out.trim().split("\n").length, 1);
-  assert.match(out, /tok\/s/);
-});
-
-test("CLI: 文件不存在时退出码非 0", () => {
-  assert.throws(
-    () => run("cc-watch.js", ["--once", path.join(tmpRoot, "nope.jsonl")]),
-    (err) => err.status === 1
-  );
+test("cc-core: 不再导出渲染器与分析入口", () => {
+  // 3.0.0 把插件收敛成「只有 Stop hook」。这条守卫防的是渲染层被重新加回来 ——
+  // 没有它，多出来的几百行没人会发现。
+  const gone = ["renderLive", "renderReport", "renderInsights", "analyze",
+                "percentile", "collectFiles", "colorFor"];
+  const still = gone.filter((k) => core[k] !== undefined);
+  assert.deepEqual(still, [], `这些入口已被 3.0.0 移除，不该再导出：${still.join(", ")}`);
 });
 
 // ── 端到端：Stop hook ───────────────────────────────────────────────────
@@ -1307,15 +1011,6 @@ test("hook: transcript 指向不存在的文件时不崩", () => {
   assert.equal(typeof out, "string"); // 退出码 0 由 execFileSync 保证
 });
 
-// ── doctor ──────────────────────────────────────────────────────────────
-
-test("doctor: 正常退出并打印检查项", () => {
-  const out = run("cc-doctor.js", []);
-  assert.match(out, /cc-toolkit 环境自检/);
-  assert.match(out, /Node\.js/);
-  assert.match(out, /Stop hook/);
-});
-
 // ── 组件引用完整性 ──────────────────────────────────────────────────────
 
 /**
@@ -1355,12 +1050,12 @@ function collectFiles(dir, { includeDotDirs = false } = {}) {
   return out;
 }
 
-test("引用完整性: 命令 / hooks / 文档里提到的脚本都真实存在", () => {
+test("引用完整性: hooks / 文档里提到的脚本都真实存在", () => {
   // 带 .claude-plugin/：plugin.json 的描述面向用户，和 .md 一样会过期
   const files = collectFiles(PLUGIN_ROOT, { includeDotDirs: true }).filter((f) =>
     /\.(md|json|js|sh)$/.test(f)
   );
-  const re = /(?:scripts|commands)\/[A-Za-z0-9._-]+\.(?:js|sh|json|md)/g;
+  const re = /scripts\/[A-Za-z0-9._-]+\.(?:js|sh|json|md)/g;
 
   const missing = [];
   for (const file of files) {
@@ -1446,6 +1141,25 @@ test("词表一致性: 文档与描述里不再出现已废弃的说法", () => 
       re: /首字等待|TTFT/,
       why: "2.3.0 起改称「首块等待」，且不再是默认读数 —— 它含首块生成时间",
     },
+    // 3.0.0 把插件收敛成「只有 Stop hook」：三个斜杠命令、CLI、环境自检、
+    // 渲染层与分析层全部删除。删掉的组件名同样要进这份清单 ——
+    // 549 行 README 与三份清单 JSON 里逐处手抄的文案不会自己跟着改。
+    {
+      re: /cc-watch|cc-doctor/,
+      why: "3.0.0 移除了 cc-watch.js 与 cc-doctor.js，只在 hook 里读数",
+    },
+    {
+      re: /\/cc-toolkit:tps/,
+      why: "3.0.0 移除了三个斜杠命令，插件只剩一个 Stop hook",
+    },
+    {
+      re: /ttft/i,
+      why: "3.0.0 移除了 ttft 相关的一切：字段、文案与 plugin.json 的 keyword",
+    },
+    {
+      re: /统计视图|分层归因|离群样本/,
+      why: "3.0.0 移除了步级统计链路，不再有中位/p90/分层/离群这些聚合视图",
+    },
   ];
 
   const files = [
@@ -1478,20 +1192,19 @@ test("词表一致性: 文档与描述里不再出现已废弃的说法", () => 
   assert.deepEqual(hits, [], `已废弃的说法又出现了：\n${hits.join("\n")}`);
 });
 
-test("引用完整性: 命令与 hooks 只调用 scripts/ 下实际存在的入口", () => {
+test("引用完整性: hooks 只调用 scripts/ 下实际存在的入口", () => {
+  // 3.0.0 删掉了 commands/，扫描范围只剩 hooks/ —— 否则 readdirSync 会直接抛 ENOENT。
   const available = new Set(fs.readdirSync(SCRIPTS));
-  const named = new Set();
 
-  for (const f of collectFiles(path.join(PLUGIN_ROOT, "commands")).concat(
-    collectFiles(path.join(PLUGIN_ROOT, "hooks"))
-  )) {
+  const named = new Set();
+  for (const f of collectFiles(path.join(PLUGIN_ROOT, "hooks"))) {
     for (const m of fs.readFileSync(f, "utf8").matchAll(/scripts\/([A-Za-z0-9._-]+\.js)/g)) {
       named.add(m[1]);
     }
   }
 
   const unknown = [...named].filter((n) => !available.has(n));
-  assert.deepEqual(unknown, [], `命令 / hook 调用了不存在的脚本：${unknown.join(", ")}`);
+  assert.deepEqual(unknown, [], `hook 调用了不存在的脚本：${unknown.join(", ")}`);
   assert.ok(named.size > 0, "没扫到任何脚本引用，说明扫描逻辑失效了");
 });
 

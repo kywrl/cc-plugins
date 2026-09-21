@@ -4,6 +4,68 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [3.0.0] - 2026-09-22
+
+**插件只保留 Stop hook** —— 三个斜杠命令、CLI、环境自检全部移除。
+
+### 移除
+
+- **三个斜杠命令**：`/cc-toolkit:tps`、`/cc-toolkit:tps-live`、`/cc-toolkit:tps-doctor`
+  连同 `commands/` 整目录删除。
+- **`scripts/cc-watch.js`**（CLI：实时 / `--report` / `--insights` / `--once` / `--json`）
+  与 **`scripts/cc-doctor.js`**（环境自检）。
+
+  它们的价值是"查历史分布"，而那需要用户先知道自己想比什么；
+  插件唯一不可替代的部分是**每轮回复后那行读数** —— 装好即生效，不用记得去查。
+  数据源本身是纯文本 JSONL（`~/.claude/projects/<项目目录名>/<session-id>.jsonl`），
+  要横向分析随时可以交给别的工具。
+
+- **`cc-core.js` 的渲染层与分析层**：`renderLive` / `renderGroups` / `renderReport` /
+  `renderInsights` / `analyze`，以及 `COLORS` / `colorFor` / `colorForCache` /
+  `secs` / `percentile` 等只服务于它们的工具。
+- **`cc-core.js` 的整条步级采样链路**：`_describe()` / `finalizedSamples()` /
+  `recentSamples()` / `currentSpeed()` / `stats()` / `breakdown()` / `sessionFacts()` /
+  `rollup()` / `samples[]`，以及 `MIN_SAMPLE_TOKENS` / `MIN_SAMPLE_MS` / `MAX_SAMPLES` /
+  `MAX_ATTRIBUTION_MS` / `LOW_CACHE_HIT_RATIO` / `STREAMING_WINDOW_MS` 六个常量。
+
+  这条链路的唯一对外出口是 hook 的 `median` 字段（默认不显示的"近 9 条中位"），
+  为一个默认关闭的读数养 200 行统计代码不划算 —— `CC_TOOLKIT_SHOW` 的 `median`
+  选项一并移除。`CC_TOOLKIT_MIN_TOKENS` 的行为**不变**：它从来只作用于本轮读数。
+
+- **死码**：`_describe()` 与 `archiveRound()` 在 2.3.0 收敛后已无调用方；
+  `lastRound` 字段只写不读。
+
+### 变更
+
+- `cc-core.js` 从 1546 行降到 840 行，**只剩一条读数路径**：`latestRound()`
+  → `_describeTurn()`。文件头注释同步重写（原文写着"被两个入口复用"、
+  并有一整段讲"统计样本切在步上"的口径，删掉后就是错误文档）。
+- `cc-hook.js` 去掉 `ttft` 死分支（`_describeTurn` 自 2.4.0 起不再返回 `ttftMs`，
+  这个分支永远只输出"首块 —"）。
+- `apiErrors` 保留 —— hook 的"本轮期间有 N 次 API 重试"提示要用它。
+  `turn_duration` / `stop_hook_summary` 的解析随 `sessionFacts()` 一起删掉。
+
+### 测试
+
+66 → **52 个**。删除 CLI / doctor / `analyze` / `breakdown` / 统计过滤器相关共 15 个；
+改写 8 个原先经由 `samples` / `recentSamples()` / `currentSpeed()` / `stats()` 断言的用例，
+统一走 `latestRound()` 这条唯一路径。
+
+新增守卫「`cc-core` 不再导出渲染器与分析入口」—— 断言 `renderLive` / `renderReport` /
+`renderInsights` / `analyze` / `percentile` 都是 `undefined`，防止渲染层被重新加回来。
+
+两条既有守卫同步更新：`引用完整性: hooks 只调用 scripts/ 下实际存在的入口`
+不再扫已删的 `commands/`（否则 `readdirSync` 直接抛 ENOENT）；
+脚本路径守卫的正则去掉了 `commands/` 分支。`retired[]` 新增 4 条废弃说法
+（`cc-watch` / `cc-doctor` / `/cc-toolkit:tps` / `ttft`），首次把"删掉的组件名"也纳入词表守卫。
+
+### 说明
+
+版本号取 3.0.0 是因为破坏了对外形态（组件被删、CLI 消失）。插件内部仍保留
+`cc-core.js` 这个名字与两文件拆分：hook 的读数逻辑（JSONL 解析、轮次聚合、
+decode 同源计算）值得跟协议适配层分开，混进 `cc-hook.js` 会让那 228 行的
+静默策略被算法细节淹没。
+
 ## [2.5.0] - 2026-09-21
 
 **「每秒输出」虚高一个数量级，已修。** 实测该 provider 正常值约 200 tok/s，

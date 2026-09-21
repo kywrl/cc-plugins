@@ -1,7 +1,7 @@
 # cc-plugins
 
 本仓库是 Claude Code 插件市场（market name `cc-plugins`，owner `kywrl`，发布在 `github.com:kywrl/cc-plugins`）。
-目前只含一个插件 `cc-toolkit`（v2.5.0）。
+目前只含一个插件 `cc-toolkit`（v3.0.0）—— 只保留一个 Stop hook。
 
 ## 仓库形态
 
@@ -10,10 +10,9 @@
 plugins/cc-toolkit/
   .claude-plugin/plugin.json         # 插件清单（版本号唯一来源）
   hooks/hooks.json                   # Stop hook，装好即生效
-  commands/tps*.md                   # 三个斜杠命令
-  scripts/cc-{core,watch,hook,doctor}.js
+  scripts/cc-{core,hook}.js
   tests/cc-toolkit.test.js
-README.md                            # 面向用户的完整手册（549 行）
+README.md                            # 面向用户的完整手册（419 行）
 CHANGELOG.md                         # Keep a Changelog 格式，中文
 ```
 
@@ -58,12 +57,6 @@ claude plugin details cc-toolkit
 echo '{"session_id":"t","transcript_path":"/path/to/session.jsonl","hook_event_name":"Stop"}' | CC_TOOLKIT_VERBOSE=1 node plugins/cc-toolkit/scripts/cc-hook.js
 ```
 
-命令行等价入口（不装插件也能跑）：
-
-```bash
-node plugins/cc-toolkit/scripts/cc-watch.js --report --history=20
-```
-
 ## 发版流程（用户已固定的习惯）
 
 改完代码后一次走完：升 `plugin.json` 版本号 → 写 CHANGELOG（Keep a Changelog，中文）→ commit → push `origin/main` → 本地刷新安装。
@@ -85,22 +78,23 @@ claude plugin update cc-toolkit@cc-plugins
 
 ## 架构
 
-四个脚本，`cc-core.js` 是唯一有实质逻辑的地方，其余都是薄入口：
+两个脚本。3.0.0 删掉了 CLI（`cc-watch.js`）、环境自检（`cc-doctor.js`）与三个斜杠命令，
+所以 `cc-core.js` 现在只有一个调用方：
 
-- `scripts/cc-core.js` —— 纯函数库 + `SessionTracker` 类。会话文件发现、JSONL 增量解析、
-  轮次归档、tok/s 统计、分层归因、三套渲染器（`renderLive` / `renderReport` / `renderInsights`）。
-  无副作用，可直接 `require` 进别的脚本。
-- `scripts/cc-watch.js` —— CLI：实时 / `--report` / `--insights` / `--once` / `--json`。
+- `scripts/cc-core.js` —— 计算引擎：会话文件发现、JSONL 增量解析、轮次聚合、三格读数。
+  无副作用，可直接 `require`，但**不再是对外接口** —— 它只服务于 hook。
 - `scripts/cc-hook.js` —— Stop hook：stdin 读事件 → stdout 吐 `{"systemMessage": ...}`。
   只把读数展示给用户，**不进模型上下文**（不花 token）——所以用 `systemMessage` 而不是
   `decision:"block"` 或 `additionalContext`。任何异常都 `exit 0` 静默，绝不干扰会话。
-- `scripts/cc-doctor.js` —— 环境自检。
+
+拆成两个文件是因为两边的关注点不同：`cc-hook.js` 是协议适配 + 静默策略（什么时候**不**输出），
+`cc-core.js` 是算法（一轮怎么聚合、decode 怎么同源）。
 
 ### 数据源与不可绕过的限制
 
 数据源是 Claude Code 自己写的会话日志 `~/.claude/projects/<项目目录名>/<session-id>.jsonl`，
 项目目录名 = 工作目录的非字母数字全换成 `-`（`projectDirFor`）。默认只回放文件末尾 2MB
-（`REPLAY_TAIL_BYTES`），`--all` 才全量。
+（`REPLAY_TAIL_BYTES`）—— hook 只关心刚刚结束的那一轮，没必要读整个文件。
 
 会话文件是**内容块级**落盘，不是逐 token 流式写入。这条限制推导出本插件大部分设计：
 
@@ -127,14 +121,13 @@ claude plugin update cc-toolkit@cc-plugins
 | `cache.hitRatio` 缓存命中 | `cache_read / (cache_read + cache_creation + input)` | — |
 
 **默认三格是 `steps,decode,cache`**（`cc-hook.js` 的 `CC_TOOLKIT_SHOW` 默认值）。
-`ttft` 仍可显式要，但 2.4.0 起不再是默认读数 —— 见下面「已退役」。
 
-**已退役：`ttftMs` / 「首字」**（2.4.0）。原实现测「你按下回车 → 本轮首个内容块落盘」，
-那是**等待 + 首块生成时间**的合计，而首块大小在一轮之间差几十倍（实测 ≥1000 字符时
-中位 26–29s，<50 字符时 9–13s），跨轮次比较会把「首块更大」误读成「等得更久」。
-更根本的是模型吐出**第一个 token** 的时刻在块级落盘的日志里不可观测。
-字段与 `ttftMeaningful` / `medianTtftMs` / `MAX_PLAUSIBLE_TTFT_MS` 都已删除；
-词表守卫把 `首字` 列为废弃说法，改文案时别写回去。
+**已退役：`ttftMs` / 「首字」**（2.4.0，3.0.0 把残留的解析与渲染也删了）。
+原实现测「你按下回车 → 本轮首个内容块落盘」，那是**等待 + 首块生成时间**的合计，
+而首块大小在一轮之间差几十倍（实测 ≥1000 字符时中位 26–29s，<50 字符时 9–13s），
+跨轮次比较会把「首块更大」误读成「等得更久」。更根本的是模型吐出**第一个 token**
+的时刻在块级落盘的日志里不可观测。词表守卫把 `首字` 与 `ttft` 都列为废弃说法，
+改文案时别写回去。
 
 `decodeTps` 与整轮 `tps` 是**两个量**：整轮口径含 prefill 与步之间的工具执行时间。
 若用整轮首块→末块当 decode 分母，工具等待会被当成解码时间，实测中位从 128 掉到 10 tok/s。
@@ -147,20 +140,21 @@ claude plugin update cc-toolkit@cc-plugins
 解析时按行分配会让第一行吃掉整步的量。所以解析时只记每行的字符权重
 （含 `tool_use` 的 `input`，否则纯工具调用的行权重为 0），摊分在 `tokensWithinSpan` 里做。
 
-每轮读数与统计视图**切在不同层**，这是有意设计：
+**读数只有一条路径**（2.3.0 收敛，3.0.0 收窄到只剩轮级）：
 
-- **每轮读数（hook）** 切在**轮**上，走 `latestRound()` → `_describeTurn()`。
+- `latestRound()` → `_describeTurn()` 是**唯一**入口，切在**轮**上。
   一轮里可能有几十上百步，`_describeTurn` 把它们聚拢起来算（旧实现只读最后一个
   `message.id`，实测低估 tokens 最多 365 倍）。
-- **统计样本（`/cc-toolkit:tps`、`cc-watch.js`）** 切在**步**上，走 `_describe(g)`。
-  这个粒度能自然剔掉工具执行时间，让历史样本之间可比。
-
-**记账只有一份，读数只有一条路径**（2.3.0 收敛，改这块前务必先读）：
+- 3.0.0 删掉了步级的 `_describe(g)` 与整条统计采样链（`samples` / `recentSamples()` /
+  `stats()` / `breakdown()` / `sessionFacts()` / `rollup()`）—— 它唯一的对外出口是 hook 的
+  `median` 字段（默认关闭的「近 9 条中位」）。**别把步级读数加回来**：
+  `latestRound()` 不套任何下限，新增聚合只会把「本轮读数」和「历史样本」两个口径重新搅在一起。
+- **记账只有一份**：
 
 - `groups`（Map，按 id 找**当前步**）与 `currentSteps`（数组，按顺序回看**本轮所有步**）
   是**同一批记录对象**的两个视图 —— `step()` 建记录时同时塞进两者。
   曾经它们各是一套累积器，同一份 usage / 元数据写两遍，必然对不齐。
-- 步记录是唯一形态：`_describe` 与 `_describeTurn` 都读同一个记录结构
+- 步记录是唯一形态：`_describeTurn` 读的就是 `step()` 建的那个记录结构
   （`hasUsage` / `out` / `est` / `ts` / `cacheRead`…）。
 - `mergeUsage(step, usage)` 是唯一的 usage 写入点，`applyMeta(target, record)`
   是唯一的元数据写入点（字段清单只此一处）。
@@ -169,37 +163,44 @@ claude plugin update cc-toolkit@cc-plugins
 
 ### 容易踩的取舍（改代码前先读这里）
 
-- **统计过滤器 ≠ 本轮读数过滤器。** `MIN_SAMPLE_TOKENS`(50) / `MIN_SAMPLE_MS`(300) 只服务于
-  中位数、p90 这类聚合。hook 要走 `latestRound()`（不套过滤），否则用户的
-  `CC_TOOLKIT_MIN_TOKENS` 形同虚设 —— v1.0.1 修的就是这个 bug。
+- **本轮读数不套任何过滤器。** 唯一的显示下限是用户的 `CC_TOOLKIT_MIN_TOKENS`
+  （由 `cc-hook.js` 一处判断）。v1.0.1 修的就是「统计过滤器误用在读数上」这个 bug ——
+  3.0.0 把那条过滤器整个删掉了，所以现在不可能再犯，但**别以「过滤噪声」为名加回来**。
 - **三格位置固定**：某一项算不出来就渲染 `—`，不让整段消失。`hasAnyRealReading()` 只在
   三格全空时才静默。
 - **`truncatedAnchor`**：回放窗口从文件中途开始时，本轮的用户行可能被切掉，`durMs`/`tps`
-  的分母少了一整段起点（实测 57 → 133 tok/s 的系统性虚高）。这类轮次**不进聚合**。
+  的分母少了一整段起点（实测 57 → 133 tok/s 的系统性虚高）。这类轮次 `durMs`/`tps`
+  直接给 0，由渲染层显示 `—` —— 宁可不报，也不报一个系统性偏高的数。
 - **轮次锚点只认真人输入**：`tool_result` 回流与 `isMeta` 技能注入都不算新一轮（见
   `isHumanInput`），拿它们当锚点会把一轮越切越碎。
 - **`null` 与 `0` 语义不同**：`decodeTps: null` 是「测不出来」，`thinkingShare: null` 是
   「provider 没上报这个字段」，都不是 0，渲染时不能混。
-- 时间窗口常量集中在 `cc-core.js` 顶部（`STREAMING_WINDOW_MS`、`MAX_ATTRIBUTION_MS`、
-  `MIN_DECODE_MS`、`LOW_CACHE_HIT_RATIO`、`MAX_STEPS_PER_TURN`）。
-- **步数是轮级量**：`_describe`（步级）里没有 `calls`，渲染时要从 `tracker.currentTurn()`
-  取。`renderLive` / `renderReport` 的 `currentSpeed()` 给的是步级读数 —— 别在那儿读 `calls`。
+- 常量集中在 `cc-core.js` 顶部，3.0.0 后只剩三个：`REPLAY_TAIL_BYTES`、
+  `MIN_DECODE_MS`、`MAX_STEPS_PER_TURN`。
+- **步数是轮级量**：`calls` 只在 `_describeTurn` 的返回值里，`step()` 建的步记录没有这个字段。
 
 ## 测试
 
-`plugins/cc-toolkit/tests/cc-toolkit.test.js`，Node 内置测试运行器，66 个测试，零依赖。
+`plugins/cc-toolkit/tests/cc-toolkit.test.js`，Node 内置测试运行器，52 个测试，零依赖。
 夹具用 `writeTranscript`（每轮 = user 行 + N 个内容块）/ `writeMultiCallTurn`（一轮里多次
-API 调用，中间可夹工具间隙）造假 transcript，用 `execFileSync` 起真实子进程跑 hook / CLI，
+API 调用，中间可夹工具间隙）造假 transcript，用 `execFileSync` 起真实子进程跑 hook，
 所以断言的是端到端输出。
 
 **改文案时要留意的两类守卫测试**（它们才是这个仓库真正的回归网）：
 
 - `词表一致性: 文档与描述里不再出现已废弃的说法` —— `retired[]` 是一份「已废弃说法」清单，
   扫描插件目录 + 仓库根 README/CHANGELOG/marketplace.json。发布新版本、改了输出格式或
-  删了组件后，**要把旧说法加进这个清单**，否则 549 行 README、plugin.json 描述、
-  marketplace.json 描述里逐处手抄的文案就会漏改（实测漏过三处）。
-- `引用完整性: ...` —— 校验 `.md` / `hooks.json` 里的 `scripts/*.js` 路径真实存在，
-  且脚本名遵循 `cc-` 前缀。README 里的路径写错不会立刻报错，只在该命令被调用时才炸。
+  删了组件后，**要把旧说法加进这个清单**，否则几百行 README、plugin.json 描述、
+  marketplace.json 描述里逐处手抄的文案就会漏改（实测漏过三处）。3.0.0 起**删掉的组件名
+  也要进清单**（`cc-watch` / `cc-doctor` / `/cc-toolkit:tps`），实测这三处各漏过一次。
+- `引用完整性: ...` —— 两条：`.md` / `hooks.json` 里的 `scripts/*.js` 路径必须真实存在；
+  hooks 引用的脚本名必须真在 `scripts/` 下，且命名遵循 `cc-` 前缀。
+  README 里的路径写错不会立刻报错，只在该命令被调用时才炸。
+  3.0.0 删掉 `commands/` 后，第二条的扫描范围只剩 `hooks/` —— 别再让它扫目录列表里的其他项，
+  否则 `readdirSync` 会对不存在的目录抛 ENOENT。
+- `cc-core: 不再导出渲染器与分析入口` —— 断言 `renderLive` / `renderReport` /
+  `renderInsights` / `analyze` / `percentile` 都是 `undefined`。防的是删掉的渲染层
+  被重新加回来（那几百行加回来不会有任何别的东西报警）。
 
 测试文件随插件分发，也会从安装缓存里跑：`REPO_ROOT` 只在真的能看到 `plugins/cc-toolkit`
 时才纳入扫描范围（`IN_REPO`），否则会读到缓存目录里的历史版本文案而误判失败。
