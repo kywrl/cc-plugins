@@ -978,23 +978,6 @@ const colorForCache = (r) => (r >= 0.7 ? COLORS.ok : r >= 0.5 ? COLORS.warn : CO
 const pct = (x) => `${(x * 100).toFixed(0)}%`;
 const secs = (ms) => `${(ms / 1000).toFixed(1)}s`;
 
-/**
- * 构造一条桌面通知的终端转义序列。
- *
- * Claude Code 允许 hook 通过 terminalSequence 字段代为发出 OSC 9 / OSC 777
- * （只放行通知与标题类 OSC，其余会被丢弃）。支持的终端（iTerm2、WezTerm、
- * Ghostty、kitty 等）会弹系统通知；不支持的终端只是忽略序列，没有副作用。
- *
- * 控制字符一律剥掉，避免把内容里的转义序列注入到终端。
- */
-function notifySequence(title, body) {
-  const clean = (s) =>
-    String(s == null ? "" : s)
-      .replace(/[\x00-\x1f\x7f]/g, " ")
-      .slice(0, 200);
-  return `\x1b]777;notify;${clean(title)};${clean(body)}\x07`;
-}
-
 /** 一行式实时读数（带 ANSI 色） */
 function renderLive(tracker, now = Date.now()) {
   const c = COLORS;
@@ -1251,7 +1234,6 @@ module.exports = {
   renderLive,
   renderReport,
   renderInsights,
-  notifySequence,
   colorFor,
   COLORS,
 };

@@ -678,32 +678,62 @@ test("hook: 短回复（低于统计下限但高于 CC_TOOLKIT_MIN_TOKENS）仍�
   });
   assert.notEqual(out, "", "短回复不该静默");
   const payload = JSON.parse(out);
-  assert.match(payload.systemMessage, /⚡ 本轮 19 tok\/s/);
-  assert.match(payload.systemMessage, /2\.4s/, "应带上本轮耗时");
+  assert.match(payload.systemMessage, /首字 0\.8s/, "应带首字等待");
+  assert.match(payload.systemMessage, /每秒输出 \d+ tok\/s/, "应带每秒输出");
 });
 
-test("hook: 默认把首字等待与纯解码分开报（不再只给一个合成数字）", () => {
-  // 3 个块、每块间隔 800ms：整轮 2.4s，但纯解码跨度只有 1.6s。
-  // 合成一个 tok/s 会让 prefill 被误读成模型变慢，所以两个口径都要在。
-  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }]);
+test("hook: 三个字段用 | 分隔，且不带「本轮」「⚡」这类前缀", () => {
+  const file = patchUsage(
+    writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }], { name: "fmt-session.jsonl" }),
+    { input_tokens: 80, cache_read_input_tokens: 920 } // 920/1000 = 92%
+  );
   const out = run("cc-hook.js", [], {
-    input: JSON.stringify({ session_id: "split-session", transcript_path: file }),
+    input: JSON.stringify({ session_id: "fmt", transcript_path: file }),
   });
   const msg = JSON.parse(out).systemMessage;
-  assert.match(msg, /首字 \d+\.\d+s/, "应报告首字等待（TTFT）");
-  assert.match(msg, /解码 \d+/, "应报告纯解码速度");
+  assert.equal(msg, "首字 0.8s | 每秒输出 250 tok/s | 缓存命中 92%", "三段读数，| 分隔");
+  assert.doesNotMatch(msg, /本轮/, "不该再有「本轮」");
+  assert.doesNotMatch(msg, /⚡/, "不该再有 ⚡ 前缀");
+  assert.doesNotMatch(msg, /·/, "分隔符应为 |");
+});
+
+test("hook: 「每秒输出」用纯解码口径，扣掉首字等待", () => {
+  // 3 个块、每块间隔 800ms：整轮 2.4s、首字 0.8s，纯解码跨度只有 1.6s。
+  // 400 tok / 1.6s = 250 tok/s；若误用整轮口径会得到 167。
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }], { name: "decode-session.jsonl" });
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: "decode", transcript_path: file }),
+  });
+  const msg = JSON.parse(out).systemMessage;
+  assert.match(msg, /每秒输出 250 tok\/s/, "应是纯解码速度，不是含 prefill 的整轮速度");
+  assert.doesNotMatch(msg, /每秒输出 167 tok\/s/, "整轮口径会重复计入首字等待");
+});
+
+test("hook: 测不出纯解码时省略该段，不拿整轮速度冒充", () => {
+  // 单块回复：首块即末块，decodeTps 测不出来
+  const file = patchUsage(
+    writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 1 }], { name: "singleblock-session.jsonl" }),
+    { input_tokens: 80, cache_read_input_tokens: 920 }
+  );
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: "single", transcript_path: file }),
+  });
+  const msg = JSON.parse(out).systemMessage;
+  assert.doesNotMatch(msg, /每秒输出/, "拆不出来就不该报，而不是退回含 prefill 的数");
+  assert.match(msg, /缓存命中 92%/, "其余字段照常");
 });
 
 test("hook: CC_TOOLKIT_SHOW 能裁剪输出行", () => {
-  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }]);
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }], { name: "show-session.jsonl" });
   const out = run("cc-hook.js", [], {
-    input: JSON.stringify({ session_id: "show-session", transcript_path: file }),
+    input: JSON.stringify({ session_id: "show", transcript_path: file }),
     env: { CC_TOOLKIT_SHOW: "tps" },
   });
   const msg = JSON.parse(out).systemMessage;
-  assert.match(msg, /tok\/s/);
+  assert.match(msg, /整轮 \d+ tok\/s/);
   assert.doesNotMatch(msg, /首字/, "首字不在 show 里就不该出现");
-  assert.doesNotMatch(msg, /解码/, "解码不在 show 里就不该出现");
+  assert.doesNotMatch(msg, /每秒输出/, "每秒输出不在 show 里就不该出现");
+  assert.doesNotMatch(msg, /缓存命中/, "缓存不在 show 里就不该出现");
   assert.doesNotMatch(msg, /近\d+条中位/, "median 不在 show 里就不该出现");
 });
 
@@ -720,8 +750,8 @@ test("hook: max_tokens 截断时给出告警", () => {
   assert.match(JSON.parse(out).systemMessage, /max_tokens 截断/);
 });
 
-test("hook: 缓存命中过低时给出告警", () => {
-  // 命中率 = read/(read+write+fresh) = 10/1010 ≈ 1%
+test("hook: 缓存命中低不再额外提示（读数本身已经写了）", () => {
+  // 命中率 = read/(read+write+fresh) = 10/1010 ≈ 1%，属于典型的「缓存没生效」
   const file = patchUsage(writeTranscript([{ id: "m", ms: 2000, tokens: 400 }]), {
     input_tokens: 1000,
     cache_read_input_tokens: 10,
@@ -730,7 +760,10 @@ test("hook: 缓存命中过低时给出告警", () => {
   const out = run("cc-hook.js", [], {
     input: JSON.stringify({ session_id: "cache-alert-session", transcript_path: file }),
   });
-  assert.match(JSON.parse(out).systemMessage, /prompt 缓存命中仅/);
+  const msg = JSON.parse(out).systemMessage;
+  assert.match(msg, /缓存命中 1%/, "命中率照常显示");
+  assert.doesNotMatch(msg, /缓存命中仅/, "结论式的提示应该没有");
+  assert.doesNotMatch(msg, /首字等待和成本都会偏高/, "不该替用户下结论");
 });
 
 test("hook: CC_TOOLKIT_ALERTS=0 时关掉告警", () => {
@@ -747,41 +780,28 @@ test("hook: CC_TOOLKIT_ALERTS=0 时关掉告警", () => {
   assert.doesNotMatch(JSON.parse(out).systemMessage, /截断/);
 });
 
-test("hook: QUIET 模式下慢速提示有冷却，不会每轮刷屏", () => {
-  const id = `cool-${Math.random().toString(36).slice(2)}`;
-  const file = writeTranscript([{ id: "m", ms: 5000, tokens: 100 }]); // 20 tok/s
-  const event = JSON.stringify({ session_id: id, transcript_path: file });
-  const env = { CC_TOOLKIT_QUIET: "1", CC_TOOLKIT_SLOW_TOKENS_PER_SEC: "40" };
-
-  assert.match(JSON.parse(run("cc-hook.js", [], { input: event, env })).systemMessage, /🐢/);
-  // 同一会话紧接着再来一次：应被冷却吃掉
-  assert.equal(run("cc-hook.js", [], { input: event, env }), "", "冷却期内不应重复提示");
-  fs.rmSync(path.join(os.tmpdir(), `cc-toolkit-state-${id}.json`), { force: true });
+test("hook: 输出里没有「偏慢」这类结论，慢轮次也只给读数", () => {
+  // 20 tok/s，在任何阈值下都算慢 —— 但 hook 只报数，不评价
+  const file = writeTranscript([{ id: "m", ms: 5000, tokens: 100, chunks: 3 }], { name: "slow-session.jsonl" });
+  const out = run("cc-hook.js", [], {
+    input: JSON.stringify({ session_id: "slow", transcript_path: file }),
+  });
+  const msg = JSON.parse(out).systemMessage;
+  assert.doesNotMatch(msg, /偏慢/);
+  assert.doesNotMatch(msg, /🐢/);
+  assert.match(msg, /每秒输出 \d+ tok\/s/);
 });
 
-test("hook: CC_TOOLKIT_NOTIFY=1 且偏慢时附带桌面通知序列", () => {
-  const id = `notify-${Math.random().toString(36).slice(2)}`;
-  const file = writeTranscript([{ id: "m", ms: 5000, tokens: 100 }]); // 20 tok/s
+test("hook: 不再有 QUIET / NOTIFY 行为", () => {
+  const file = writeTranscript([{ id: "m", ms: 5000, tokens: 100 }], { name: "noquiet-session.jsonl" });
   const out = run("cc-hook.js", [], {
-    input: JSON.stringify({ session_id: id, transcript_path: file }),
-    env: { CC_TOOLKIT_NOTIFY: "1", CC_TOOLKIT_SLOW_TOKENS_PER_SEC: "40" },
+    input: JSON.stringify({ session_id: "noquiet", transcript_path: file }),
+    env: { CC_TOOLKIT_QUIET: "1", CC_TOOLKIT_NOTIFY: "1", CC_TOOLKIT_SLOW_TOKENS_PER_SEC: "40" },
   });
   const payload = JSON.parse(out);
-  assert.ok(payload.terminalSequence, "应带上 terminalSequence");
-  assert.match(payload.terminalSequence, /^\x1b\]777;notify;/, "应为 OSC 777 通知序列");
-  assert.match(payload.terminalSequence, /\x07$/, "应以 BEL 结束");
-  fs.rmSync(path.join(os.tmpdir(), `cc-toolkit-state-${id}.json`), { force: true });
-});
-
-test("hook: 默认不发桌面通知（不打扰）", () => {
-  const id = `nonotify-${Math.random().toString(36).slice(2)}`;
-  const file = writeTranscript([{ id: "m", ms: 5000, tokens: 100 }]);
-  const out = run("cc-hook.js", [], {
-    input: JSON.stringify({ session_id: id, transcript_path: file }),
-    env: { CC_TOOLKIT_SLOW_TOKENS_PER_SEC: "40" },
-  });
-  assert.equal(JSON.parse(out).terminalSequence, undefined);
-  fs.rmSync(path.join(os.tmpdir(), `cc-toolkit-state-${id}.json`), { force: true });
+  assert.ok(payload.systemMessage, "QUIET 已移除，即便设了也不该静默");
+  assert.doesNotMatch(payload.systemMessage, /偏慢/);
+  assert.equal(payload.terminalSequence, undefined, "桌面通知已移除");
 });
 
 test("hook: CC_TOOLKIT_MIN_TOKENS 高于本轮时仍然静默", () => {
@@ -1225,8 +1245,7 @@ test("hook: 收到事件后输出 {systemMessage}，且不含 extra 字段", () 
   const payload = JSON.parse(out);
   // Stop hook 是控制类 hook，不接受 decision/continue，只回 systemMessage 最安全
   assert.equal(Object.keys(payload).length, 1);
-  assert.match(payload.systemMessage, /⚡ 本轮 \d+ tok\/s/);
-  assert.match(payload.systemMessage, /近\d+条中位/);
+  assert.match(payload.systemMessage, /^首字 [\d.]+s \| 每秒输出 \d+ tok\/s$/);
 });
 
 test("hook: stop_hook_active 时静默，防止递归", () => {
@@ -1255,19 +1274,16 @@ test("hook: CC_TOOLKIT_MIN_TOKENS 高于实际输出时静默", () => {
   assert.equal(out, "");
 });
 
-test("hook: CC_TOOLKIT_QUIET=1 在速度正常时静默，偏慢时告警", () => {
-  const fast = writeTranscript([{ id: "m", ms: 1000, tokens: 500 }]); // 500 tok/s
-  assert.equal(
-    run("cc-hook.js", [], { input: JSON.stringify({ transcript_path: fast }), env: { CC_TOOLKIT_QUIET: "1" } }),
-    ""
+test("hook: 速度正常与偏慢都照常输出读数（没有静默档）", () => {
+  const fast = writeTranscript([{ id: "m", ms: 1000, tokens: 500 }], { name: "fast-always.jsonl" });
+  assert.match(
+    JSON.parse(run("cc-hook.js", [], { input: JSON.stringify({ transcript_path: fast }) })).systemMessage,
+    /每秒输出 \d+ tok\/s/
   );
 
-  const slow = writeTranscript([{ id: "m", ms: 5000, tokens: 100 }]); // 20 tok/s
-  const out = run("cc-hook.js", [], {
-    input: JSON.stringify({ transcript_path: slow }),
-    env: { CC_TOOLKIT_QUIET: "1", CC_TOOLKIT_SLOW_TOKENS_PER_SEC: "40" },
-  });
-  assert.match(JSON.parse(out).systemMessage, /🐢 本轮偏慢/);
+  const slow = writeTranscript([{ id: "m", ms: 5000, tokens: 100 }], { name: "slow-always.jsonl" });
+  const out = run("cc-hook.js", [], { input: JSON.stringify({ transcript_path: slow }) });
+  assert.match(JSON.parse(out).systemMessage, /每秒输出 \d+ tok\/s/, "慢轮次也给同样的读数行");
 });
 
 test("hook: stdin 不是合法 JSON 也不崩，退出码 0", () => {

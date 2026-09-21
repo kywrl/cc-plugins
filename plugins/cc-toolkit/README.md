@@ -9,12 +9,13 @@
 - 零 npm 依赖、纯本地计算、不联网
 
 ```
-⚡ 本轮 89 tok/s / 3.9s · 首字 3.2s · 解码 142 · 缓存 92%  ·  近8条中位 151 tok/s
+首字 0.8s | 每秒输出 250 tok/s | 缓存命中 92%
 ```
 
 **为什么不是一个数字**：一轮耗时里混着 prefill（读 prompt）和 decode（写回答）。
-合成一个 tok/s 时，prompt 越长读数越低，会被误读成"模型变慢"。本机实测
-整轮中位 32–71 tok/s，但纯解码中位 227–486 tok/s —— 差的正是首字等待那几秒。
+合成一个 tok/s 时，prompt 越长读数越低，会被误读成"模型变慢"。所以「每秒输出」用的是
+扣掉首字等待之后的纯解码速度。本机实测整轮中位 32–71 tok/s，但纯解码中位 227–486 tok/s
+—— 差的正是首字等待那几秒。
 
 ## 快速开始
 
@@ -31,10 +32,8 @@
 | --- | --- |
 | 开箱即用的每轮读数 | 安装后自动生效，无需配置 |
 | 打开状态栏读数 | 见仓库根 README 的「状态栏集成」 |
-| 每轮只看速度，不看其他字段 | `settings.json` → `env.CC_TOOLKIT_SHOW = "tps"` |
-| 安静模式（只在偏慢时提示） | `settings.json` → `env.CC_TOOLKIT_QUIET = "1"` |
-| 偏慢时发桌面通知 | `settings.json` → `env.CC_TOOLKIT_NOTIFY = "1"` |
-| 关掉截断/缓存/重试提示 | `settings.json` → `env.CC_TOOLKIT_ALERTS = "0"` |
+| 每轮只看其中几项 | `settings.json` → `env.CC_TOOLKIT_SHOW = "ttft,cache"` |
+| 关掉截断/重试提示 | `settings.json` → `env.CC_TOOLKIT_ALERTS = "0"` |
 | 调整显示下限 | `settings.json` → `env.CC_TOOLKIT_MIN_TOKENS = "50"` |
 | 临时关掉 | `settings.json` → `env.CC_TOOLKIT_DISABLE = "1"` |
 

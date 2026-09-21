@@ -2,12 +2,16 @@
 
 实时监控 **Claude Code 的输出速度（tok/s）**。
 
-装好即在每轮回复后看到本轮速度；`/cc-toolkit:tps` 查看历史分布、趋势、离群样本与分层归因；可选把读数放进状态栏。
+装好即在每轮回复后看到首字等待 / 每秒输出 / 缓存命中；`/cc-toolkit:tps` 查看历史分布、趋势、离群样本与分层归因；可选把读数放进状态栏。
 零 npm 依赖、纯本地计算、不联网、不上报。
 
 ```
-⚡ 本轮 89 tok/s / 3.9s · 首字 3.2s · 解码 142 · 缓存 92%  ·  近8条中位 151 tok/s
+首字 0.8s | 每秒输出 250 tok/s | 缓存命中 92%
 ```
+
+三个字段回答三个互不重叠的问题：等多久、生成多快、prompt 缓存有没有生效。
+「每秒输出」用的是**扣掉首字等待之后**的纯解码速度 —— 若用含 prefill 的整轮速度，
+同一段等待会被算进两个字段里。
 
 关键是把**首字等待**和**纯解码速度**分开报 —— 合成一个数字时，prompt 变长会被误读成"模型变慢"。
 
@@ -288,7 +292,7 @@ CLI 子进程与桌面版长期运行的进程可能状态不同。要判断你�
 ### 挂上之后怎么验证
 
 1. 让 Claude 回一句有实质内容的话（低于 `CC_TOOLKIT_MIN_TOKENS` 会被跳过，默认 30 tok）；
-2. 回复结束后应看到 `⚡ 本轮 … tok/s`；
+2. 回复结束后应看到 `首字 … | 每秒输出 … tok/s | 缓存命中 …%`；
 3. 没看到就调试：
 
 ```bash
@@ -404,12 +408,8 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 | --- | --- | --- |
 | `CC_TOOLKIT_DISABLE` | — | 设为 `1` 完全禁用（hook 与状态栏都静默退出） |
 | `CC_TOOLKIT_MIN_TOKENS` | `30` | 低于该 token 数不报告，避免"嗯"一声也弹个数。**只作用于本轮读数**，不影响中位数等统计聚合 |
-| `CC_TOOLKIT_SHOW` | `tps,ttft,decode,cache,median` | 每轮那行包含哪些字段。可选 `tps` `tokens` `ttft` `decode` `cache` `median` `thinking` `model` `effort` `skill`。例如只留速度：`CC_TOOLKIT_SHOW=tps` |
-| `CC_TOOLKIT_ALERTS` | 开 | 设为 `0` 关掉附加提示（max_tokens 截断 / refusal / 缓存命中过低 / API 重试） |
-| `CC_TOOLKIT_NOTIFY` | — | 设为 `1` 在偏慢时发一条桌面通知（OSC 777，需终端支持） |
-| `CC_TOOLKIT_NOTIFY_MIN_MS` | `60000` | 两次桌面通知的最小间隔 |
-| `CC_TOOLKIT_QUIET` | — | 设为 `1` 只在明显偏慢时才提示，平时安静（慢速提示有 5 分钟冷却，不会每轮刷屏） |
-| `CC_TOOLKIT_SLOW_TOKENS_PER_SEC` | `20` | QUIET 模式下的"慢"阈值 |
+| `CC_TOOLKIT_SHOW` | `ttft,decode,cache` | 每轮那行包含哪些字段，用 ` \| ` 连接。默认就是三个原始读数。可选 `ttft`（首字等待）`decode`（每秒输出/纯解码）`cache`（缓存命中）`tps`（整轮速度）`median`（近期中位）`tokens`（本轮 token）`thinking` `model` `effort` `skill`。例如只留速度：`CC_TOOLKIT_SHOW=decode,tps` |
+| `CC_TOOLKIT_ALERTS` | 开 | 设为 `0` 关掉附加提示（max_tokens 截断 / refusal / API 重试）。缓存命中率不在此列 —— 它本身就是默认显示的读数之一 |
 | `CC_TOOLKIT_VERBOSE` | — | 设为 `1` 把诊断信息写到 stderr |
 | `CC_TOOLKIT_STATUSLINE_PREFIX` | `⚡ ` | 状态栏前缀 |
 | `CC_TOOLKIT_STATUSLINE_FIELDS` | `tps,ttft,cache` | 状态栏显示哪些段 |
@@ -442,33 +442,36 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 
 所有输出都用 `≈` 明确区分两者，不会拿估算值冒充精确值。usage 落盘后估算值会被自动替换掉。
 
-### 三个口径，别混着看
+### 读数口径，别混着看
 
 一轮的耗时里混着两件性质完全不同的事：**prefill**（读 prompt）和 **decode**（写回答）。
 合成一个 tok/s 时，prompt 越长读数越低 —— 很容易被误读成"模型变慢了"。所以插件把它们分开报：
 
 | 口径 | 定义 | 实测（本机 3.6 万条响应） |
 | --- | --- | --- |
-| `tok/s` | 整轮 token ÷ 整轮耗时（含 prefill） | 中位 32–71 |
 | `首字`（TTFT） | 用户发出消息 → 首个内容块落盘 | 中位 **7.3s**，p90 23s |
-| `解码`（decode） | 首个内容块 → 最后一个内容块 | 中位 **227–486 tok/s** |
+| `每秒输出`（decode） | 首个内容块 → 最后一个内容块 | 中位 **227–486 tok/s** |
+| `整轮`（tps，默认不显示） | 整轮 token ÷ 整轮耗时（含 prefill） | 中位 32–71 |
 
-**为什么整轮只有几十、解码却有几百**：差的就是首字等待那几秒。所以判断"模型快不快"要看解码，
-判断"这次等得久不久"要看首字。
+**为什么整轮只有几十、每秒输出却有几百**：差的就是首字等待那几秒。所以判断"模型快不快"要看每秒输出，
+判断"这次等得久不久"要看首字。hook 那行默认只给前者，因为它才是纯生成速度；
+想看含 prefill 的整轮口径，把 `tps` 加进 `CC_TOOLKIT_SHOW`。
 
 两个口径的趋势方向不一致时，几乎总是 prompt 长度变了（prefill 变重），不是模型解码变快慢 ——
 报表里会直接提示这一点。
 
-**`解码` 显示为空是正常的**：只有 ≥2 个内容块、且首末块间隔 ≥300ms 才算得出。
+**`每秒输出` 显示为空是正常的**：只有 ≥2 个内容块、且首末块间隔 ≥300ms 才算得出。
 实测 29% 的轮次时间戳只差 1–3ms（Claude Code 把多个块一次性写盘），这种根本没有可测区间，
-插件宁可留空也不报一个上百万 tok/s 的假数字。
+插件宁可留空也不报一个上百万 tok/s 的假数字，也不用含 prefill 的整轮速度去顶替它。
 
 ### 其他口径
 
 - **耗时起点**：用"上一行日志的时间戳"，也就是用户发出消息的时刻，而不是第一个内容块落盘的时刻。
   否则首字延迟（TTFT）会被漏掉，速度看起来偏快。
 - **缓存命中率**：`cache_read ÷ (cache_read + cache_creation + input)`。本机中位 89.7%，
-  掉到 50% 以下会单独提示 —— 那意味着 prompt 缓存没生效，首字等待和成本都会涨。
+  掉到 50% 以下通常意味着 prompt 缓存没生效（改了 system prompt、换了 provider、
+  或前缀被工具结果打散），首字等待和成本都会跟着涨 —— 这个判断从读数本身就能得出，
+  所以插件只报数，不额外弹提示。
 - **thinking 占比**：`thinking_tokens ÷ output_tokens`，取自 usage 明细。
   注意 thinking token **已经包含在** output_tokens 里，不是额外的量。
   第三方 provider 通常不上报这个字段，此时显示为空，**不等于"模型没有思考"**。
@@ -512,7 +515,7 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 echo '{"session_id":"t","transcript_path":"C:/Users/me/.claude/projects/项目目录名/会话id.jsonl","hook_event_name":"Stop"}' | node "C:/path/to/plugins/cc-toolkit/scripts/cc-hook.js"
 ```
 
-5. 确认没被环境变量关掉：`CC_TOOLKIT_DISABLE` / `CC_TOOLKIT_QUIET`；
+5. 确认没被环境变量关掉：`CC_TOOLKIT_DISABLE` / `CC_TOOLKIT_MIN_TOKENS`；
 6. 还是不行 → 按 [hooks 配置方法](#hooks-配置方法) B 节手工挂进 `settings.json`。
 
 **Q: 回复很短（比如只回一句"你好"）时没有读数？**
