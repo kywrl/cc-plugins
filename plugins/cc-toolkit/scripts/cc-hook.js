@@ -46,7 +46,7 @@ const silent = (reason) => {
  * 把本轮读数拼成一行。
  *
  * 三个字段对应三个正交的事实：等多久、生成多快、prompt 缓存有没有生效。
- * 「每秒输出」用 decodeTps（各次 API 调用内部的跨度之和）而不是整轮 tps ——
+ * 「每秒输出」用 decodeTps（各步内部的跨度之和）而不是整轮 tps ——
  * 后者含 prefill 与中途的工具执行时间，和「首字」两段会重复计入同一段时间。
  *
  * 三格**位置固定**：算不出来的那个显示 —，而不是整段消失。
@@ -173,14 +173,13 @@ async function main() {
   );
 
   // 等一轮落盘再读数：Stop 事件到达时，最后若干行可能还在缓冲。
-  // 判据是「本轮出现过的 API 调用里有任意一个带上了 usage」——
-  // 只盯某一个 id 会一直等不到（usage 只落在少数 id 上）。
+  // 判据是「本轮出现过的步里有任意一步带上了 usage」——
+  // 只盯某一步会一直等不到（usage 只落在少数步上）。
   const attempts = 4;
   await new Promise((resolve) => {
     const attempt = (left) => {
       tracker.pump();
-      const t = tracker.turn;
-      const gotUsage = t && t.order.some((id) => t.byId.get(id).hasUsage);
+      const gotUsage = tracker.currentSteps.some((s) => s.hasUsage);
       if (gotUsage) return resolve();
       if (left > 0) return setTimeout(() => attempt(left - 1), 120);
       resolve();

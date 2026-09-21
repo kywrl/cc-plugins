@@ -124,14 +124,14 @@ function patchAssistant(file, extra) {
 }
 
 /**
- * 造一份「一轮里有多次 API 调用」的 transcript —— 真实 provider 的常态。
+ * 造一份「一轮里有好几步」的 transcript —— 真实 provider 的常态。
  *
- * 一次回复里模型可能调用几十上百次 API（每次一个 message.id），中间夹着工具执行。
+ * 一次回复里模型可能走几十上百步（每步一次 API 调用、一个 message.id），中间夹着工具执行。
  * usage 只落在其中**少数** id 上，其余 id 的 output_tokens 是 0。
  * 旧实现只读最后一个 id，会因此丢掉整轮读数（实测低估最多 365 倍）。
  *
  * @param {Array<{id:string, blocks:number, tokens?:number, ms:number}>} calls
- *   按顺序的一次次 API 调用。tokens 省略或为 0 = 该次调用没有 usage。
+ *   按顺序的每一步。tokens 省略或为 0 = 该步没有 usage。
  * @param {{prompt:string, toolGapMs?:number, name?:string}} [opts]
  *   toolGapMs：两次调用之间的工具执行时间（不应被算进解码速度）
  */
@@ -164,7 +164,7 @@ function writeMultiCallTurn(calls, { prompt = "prompt", toolGapMs = 0, name } = 
         })
       );
     }
-    t += toolGapMs; // 工具执行时间：两次 API 调用之间的空隙
+    t += toolGapMs; // 工具执行时间：两步之间的空隙
   }
 
   fs.writeFileSync(file, lines.join("\n") + "\n", "utf8");
@@ -195,8 +195,8 @@ test("median / percentile: 奇偶长度都正确", () => {
   assert.equal(core.percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90), 9);
 });
 
-test("SessionTracker: 一轮里多次 API 调用被聚合成一个整体", () => {
-  // 回归测试：真实 provider 一轮回复里有几十上百次 API 调用，usage 只落在
+test("SessionTracker: 一轮里的多步被聚合成一个整体", () => {
+  // 回归测试：真实 provider 一轮回复里有几十上百步，usage 只落在
   // 少数 id 上。旧实现只读最后一个 message.id，最后一个常常是
   // output_tokens: 0 的哨兵行 —— 整轮读数直接归零。
   const file = writeMultiCallTurn([
@@ -206,14 +206,14 @@ test("SessionTracker: 一轮里多次 API 调用被聚合成一个整体", () =>
   ]);
   const r = new core.SessionTracker(file).start().latestRound({ force: true });
 
-  assert.equal(r.calls, 3, "三次 API 调用属于同一轮");
+  assert.equal(r.calls, 3, "三步属于同一轮");
   assert.ok(r.tokens >= 300, "tokens 应是整轮聚合，不是最后一个 id 的 0");
   assert.ok(r.cache === null, "没有缓存字段时如实返回 null");
   assert.ok(r.ttftMs != null, "首字以真人输入为锚，恒可算");
 });
 
 test("SessionTracker: 聚合解码跨度时逐次测量，不把工具执行时间算进去", () => {
-  // 关键陷阱：一轮里两次 API 调用之间夹着工具执行（这里 10s）。
+  // 关键陷阱：一轮里两步之间夹着工具执行（这里 10s）。
   // 若用「整轮首块→末块」当分母，这段工具等待会被当成解码时间，
   // 读数被严重低估（实测从 128 压到 10 tok/s）。
   const file = writeMultiCallTurn(
@@ -304,7 +304,7 @@ test("SessionTracker: 工具结果与技能注入不作为轮次锚点", () => {
   fs.writeFileSync(file, rows.join("\n") + "\n", "utf8");
 
   const r = new core.SessionTracker(file).start().latestRound({ force: true });
-  assert.equal(r.calls, 2, "两次 API 调用都在同一轮里（没被 tool_result 切开）");
+  assert.equal(r.calls, 2, "两步都在同一轮里（没被 tool_result 切开）");
   // 锚点仍是 t0 那个真人输入 → 首字 2000ms，而不是 1000ms 或 500ms
   assert.equal(r.ttftMs, 2000, "锚点应是最初的真人输入，不是 tool_result / isMeta 行");
 });
