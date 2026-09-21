@@ -1,7 +1,7 @@
 # cc-plugins
 
 本仓库是 Claude Code 插件市场（market name `cc-plugins`，owner `kywrl`，发布在 `github.com:kywrl/cc-plugins`）。
-目前只含一个插件 `cc-toolkit`（v2.4.0）。
+目前只含一个插件 `cc-toolkit`（v2.5.0）。
 
 ## 仓库形态
 
@@ -123,7 +123,7 @@ claude plugin update cc-toolkit@cc-plugins
 | 字段 | 含义 | 口径 |
 | --- | --- | --- |
 | `calls` 本轮步数 | 轮内 `message.id` 个数（模型生成几次） | 无估算/精确之分，不带 `≈` |
-| `decodeTps` 每秒输出 | 各**步**内部（首块→末块）跨度**之和**，分子分母同源 | 纯解码 |
+| `decodeTps` 每秒输出 | 各**步**内部（首块→末块）跨度**之和**，分子只算跨度内的 token | 纯解码 |
 | `cache.hitRatio` 缓存命中 | `cache_read / (cache_read + cache_creation + input)` | — |
 
 **默认三格是 `steps,decode,cache`**（`cc-hook.js` 的 `CC_TOOLKIT_SHOW` 默认值）。
@@ -138,6 +138,14 @@ claude plugin update cc-toolkit@cc-plugins
 
 `decodeTps` 与整轮 `tps` 是**两个量**：整轮口径含 prefill 与步之间的工具执行时间。
 若用整轮首块→末块当 decode 分母，工具等待会被当成解码时间，实测中位从 128 掉到 10 tok/s。
+
+**decode 的分子分母必须同源**（2.5.0 修，改这块前务必先读 `tokensWithinSpan`）：
+块是**生成完才落盘**的，所以「首块→末块」这个跨度**不覆盖首块自己的生成时间**。
+若分子仍取整步 token，分母只覆盖尾部一小段，读数虚高一个数量级 ——
+实测某步 13.9s 生成 5904 字符的 thinking，旧口径报 2314 tok/s，同源后 195。
+分子的摊分**必须推迟到描述时**：usage 是累计快照且常在**第一行**就到达，
+解析时按行分配会让第一行吃掉整步的量。所以解析时只记每行的字符权重
+（含 `tool_use` 的 `input`，否则纯工具调用的行权重为 0），摊分在 `tokensWithinSpan` 里做。
 
 每轮读数与统计视图**切在不同层**，这是有意设计：
 
@@ -179,7 +187,7 @@ claude plugin update cc-toolkit@cc-plugins
 
 ## 测试
 
-`plugins/cc-toolkit/tests/cc-toolkit.test.js`，Node 内置测试运行器，65 个测试，零依赖。
+`plugins/cc-toolkit/tests/cc-toolkit.test.js`，Node 内置测试运行器，66 个测试，零依赖。
 夹具用 `writeTranscript`（每轮 = user 行 + N 个内容块）/ `writeMultiCallTurn`（一轮里多次
 API 调用，中间可夹工具间隙）造假 transcript，用 `execFileSync` 起真实子进程跑 hook / CLI，
 所以断言的是端到端输出。

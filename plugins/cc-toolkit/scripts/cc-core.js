@@ -213,6 +213,44 @@ function spanOf(step) {
 }
 
 /**
+ * 只统计**落在跨度内**的那些 token —— 即首块落盘之后落的块。
+ *
+ * ── 为什么分子必须这么算（2.5.0 前这里虚高一个数量级）──────────────
+ * 会话日志是块级落盘，而**一个块要生成完才落盘**。一块 5904 字符的 thinking
+ * 可能在 13.9 秒里生成、然后一次性写入，它的时间戳只是落盘那一刻 ——
+ * 生成时间在日志里没有对应事件。
+ *
+ * 于是「首块 → 末块」这个跨度天然**不覆盖首块自己的生成时间**。若分子仍取整步的
+ * token（含首块），分母只覆盖尾部一小段，读数就虚高。实测那一步：
+ * 1837 token ÷ 794ms = 2314 tok/s（该 provider 正常值约 200）。
+ *
+ * 把首块整个排除后，分子分母**同时**不含首块：这是唯一同源的口径。
+ * 代价是丢掉了首块那部分 token，样本量也变小 —— 但比报一个假数字好。
+ *
+ * ── 为什么按字符权重摊分，而不是按行记 token ──────────────────────
+ * usage 是**累计快照**，而且只在同一 message 的少数行（常常是第一行）上出现 ——
+ * 也就是说「整步 token 数」在我们还没见到后面的行时就已经知道了。
+ * 解析时按行分配必然错：第一行会把整步的量吃掉。
+ * 所以解析时只记每行的**字符权重**，摊分推迟到描述时（那时本步所有行都齐了）。
+ */
+function tokensWithinSpan(step, stepTokens) {
+  const ts = step.ts;
+  if (ts.length < 2 || !(stepTokens > 0)) return 0;
+  const first = Math.min(...ts);
+  const rows = step.rows || [];
+  if (!rows.length) return 0;
+
+  const totalWeight = rows.reduce((a, r) => a + (r.est || 0), 0);
+  const inSpanWeight = rows.reduce((a, r) => a + (r.at > first ? r.est || 0 : 0), 0);
+  // 全部行都没有可估字符（例如只有空 tool_use）→ 无从加权，退回按行数等分
+  if (totalWeight <= 0) {
+    const inSpanRows = rows.filter((r) => r.at > first).length;
+    return (stepTokens * inSpanRows) / rows.length;
+  }
+  return (stepTokens * inSpanWeight) / totalWeight;
+}
+
+/**
  * 缓存的原始量 → 展示用的命中率。
  * 分布与轮上：同一步的缓存字段本来就是这一串 token 的合计，
  * 命中率的定义在两级上是同一个式子（见 `_describeTurn` 的求和说明）。
@@ -401,6 +439,9 @@ class SessionTracker {
         // 与 firstBlockAt/lastBlockAt 是同一份时间戳，保留两者是因为
         // firstBlockAt 还兼作「这一步有没有落过内容」的判据。
         ts: [],
+        // 逐行的落盘时刻与 token 量，供 tokensWithinSpan 只取跨度内的那部分。
+        // 每行（一个 JSONL 记录）一个条目 —— 一行可能含多个块，它们同刻落盘。
+        rows: [],
         firstBlockAt: null,
         lastBlockAt: null,
         blocks: 0,
@@ -495,10 +536,13 @@ class SessionTracker {
 
       // 这一步自身的 decode 跨度。单块 / 块被一次性写盘 → 跨度为 0，
       // 没有可测区间，这一步的时间与 token 都不参与 decode 计算。
+      // 分子只取**跨度内**落的 token（见 tokensWithinSpan）—— 首块自己的生成时间
+      // 不在跨度里，它的 token 也就不能算进来。
       const span = spanOf(c);
-      if (span >= MIN_DECODE_MS && stepTokens > 0) {
+      const inSpan = tokensWithinSpan(c, stepTokens);
+      if (span >= MIN_DECODE_MS && inSpan > 0) {
         measurableMs += span;
-        measurableTokens += stepTokens;
+        measurableTokens += inSpan;
         measurableSteps++;
         if (!c.hasUsage) estDecode = true; // 只有走了估算才影响 decode 的精度
       }
@@ -644,8 +688,12 @@ class SessionTracker {
 
     // decode 跨度 = 首块 → 末块。跨度太短（块被一次性写盘）就没有可测区间，
     // 宁可报 null 也不报一个上百万 tok/s 的假数字。
+    // 分子同样只取跨度内的 token（见 tokensWithinSpan）：首块是生成完才落盘的，
+    // 它的生成时间不在跨度里，token 也就不该算进来。
     const decodeMs = g.blocks >= 2 ? Math.max(0, decodeEnd - firstBlockAt) : null;
-    const decodeTps = decodeMs >= MIN_DECODE_MS ? tokens / (decodeMs / 1000) : null;
+    const decodeTokens = tokensWithinSpan(g, tokens);
+    const decodeTps =
+      decodeMs >= MIN_DECODE_MS && decodeTokens > 0 ? decodeTokens / (decodeMs / 1000) : null;
 
     // thinking 占比：think 可能略大于 out（实测 7/29509 行如此），clamp 一下
     const thinkingTokens = Math.min(g.thinking, tokens);
@@ -874,6 +922,7 @@ class SessionTracker {
 
       // 一行 assistant 记录只需要遍历一次：步记录与轮聚合要的量都从这里取。
       // 跑两遍循环去喂两份记录，是两份记账迟早对不齐的根源。
+      let rowEst = 0;
       for (const block of record.message.content || []) {
         step.blocks++;
         turn.blocks++;
@@ -882,8 +931,27 @@ class SessionTracker {
         turn.blockTypes[bt] = (turn.blockTypes[bt] || 0) + 1;
         if (step.firstBlockType == null) step.firstBlockType = bt;
 
-        if (bt === "text") step.est += estimateTokens(block.text || "");
-        else if (bt === "thinking") step.est += estimateTokens(block.thinking || "");
+        // rowEst：**这一行的字符权重**，供 tokensWithinSpan 摊分整步 token。
+        // 三类块都要计：只算 text/thinking 会让纯 tool_use 的行权重为 0，
+        // 于是整步 token 全压到有文本的那一行（实测工具调用密集的步会因此失真）。
+        // 注意 step.est 仍只累计 text/thinking —— 那是「无 usage 时的兜底 token 数」，
+        // 与这里的权重是两件事。
+        if (bt === "text") {
+          const e = estimateTokens(block.text || "");
+          step.est += e;
+          rowEst += e;
+        } else if (bt === "thinking") {
+          const e = estimateTokens(block.thinking || "");
+          step.est += e;
+          rowEst += e;
+        } else if (bt === "tool_use") {
+          rowEst += estimateTokens(JSON.stringify(block.input || {}));
+        }
+      }
+      // 只记这一行的**字符权重**与落盘时刻。token 的摊分在 tokensWithinSpan 里做 ——
+      // 那时本步所有行都齐了，而 usage 常常在第一行就已到达（累计快照）。
+      if (ts && (record.message.content || []).length) {
+        step.rows.push({ at: ts, est: rowEst });
       }
 
       if (ts) {

@@ -576,22 +576,24 @@ test("hook: 三个字段用 | 分隔，且不带「本轮」「⚡」这类前�
     input: JSON.stringify({ session_id: "fmt", transcript_path: file }),
   });
   const msg = JSON.parse(out).systemMessage;
-  assert.equal(msg, "1 步 | 每秒输出 250 tok/s | 缓存命中 92%", "三段读数，| 分隔");
+  assert.equal(msg, "1 步 | 每秒输出 167 tok/s | 缓存命中 92%", "三段读数，| 分隔");
   assert.doesNotMatch(msg, /本轮/, "不该再有「本轮」");
   assert.doesNotMatch(msg, /⚡/, "不该再有 ⚡ 前缀");
   assert.doesNotMatch(msg, /·/, "分隔符应为 |");
 });
 
-test("hook: 「每秒输出」用纯解码口径，扣掉第一段等待", () => {
-  // 3 个块、每块间隔 800ms：整轮 2.4s、首段等待 0.8s，纯解码跨度只有 1.6s。
-  // 400 tok / 1.6s = 250 tok/s；若误用整轮口径会得到 167。
+test("hook: 「每秒输出」的分子分母同源，都只覆盖首块之后的跨度", () => {
+  // 3 个块、每块间隔 800ms，整步 400 tok。
+  // 跨度 = 首块→末块 = 1.6s；分子只算跨度内那两行（各占总字符量的 1/3）
+  // → 400×2/3 ≈ 267 tok ÷ 1.6s ≈ 167 tok/s。
+  // 回归点：分子**不能**取整步的 400（那会得到 250，实测虚高就是从这里来的）。
   const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }], { name: "decode-session.jsonl" });
   const out = run("cc-hook.js", [], {
     input: JSON.stringify({ session_id: "decode", transcript_path: file }),
   });
   const msg = JSON.parse(out).systemMessage;
-  assert.match(msg, /每秒输出 250 tok\/s/, "应是纯解码速度，不是含 prefill 的整轮速度");
-  assert.doesNotMatch(msg, /每秒输出 167 tok\/s/, "整轮口径会重复计入第一段等待");
+  assert.match(msg, /每秒输出 167 tok\/s/, "分子分母同源");
+  assert.doesNotMatch(msg, /每秒输出 250 tok\/s/, "取整步 token 会虚高（实测那一步 2314 vs 195）");
 });
 
 test("hook: 测不出纯解码时显示 — 占位，不拿整轮速度冒充", () => {
@@ -702,19 +704,23 @@ test("hook: CC_TOOLKIT_MIN_TOKENS 高于本轮时仍然静默", () => {
   assert.equal(out, "", "用户把下限调到 100，46 tok 就该静默");
 });
 
-test("SessionTracker: 区分整轮口径与纯解码速度（首段等待不计入 decode）", () => {
-  // 3 个块，每块间隔 800ms：整轮 2.4s / 400 tok = 167 tok/s，
-  // 但第一段等了 800ms，真正的解码跨度只有 1.6s → 250 tok/s。
-  // 合成一个数字时，这个差别会被完全掩盖。
+test("SessionTracker: decode 的分子分母同源，都只覆盖首块之后的跨度", () => {
+  // 3 个块，每块间隔 800ms，整步 400 tok。
+  // 跨度 = 首块→末块 = 1.6s，分子只算**跨度内**那两行（首块生成完才落盘，
+  // 它的生成时间不在跨度里，它的 token 也就不该算进来）。
+  // 首块与后两块字符量相同 → 后端两行占 2/3，即 400×2/3 ≈ 267 tok ÷ 1.6s ≈ 167。
   const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }]);
   const tracker = new core.SessionTracker(file).start();
   const r = tracker.latestRound({ force: true });
 
   assert.equal(r.durMs, 2400);
-  assert.equal(r.decodeMs, 1600, "解码跨度 = 首块 → 末块，不含首段等待");
+  assert.equal(r.decodeMs, 1600, "解码跨度 = 首块 → 末块，不含首块自己的生成时间");
   assert.equal(Math.round(r.tps), 167, "整轮口径含首段等待");
-  assert.equal(Math.round(r.decodeTps), 250, "纯解码口径不含首段等待");
-  assert.ok(r.decodeTps > r.tps, "拆开后解码速度应高于合成值");
+  assert.equal(
+    Math.round(r.decodeTps),
+    167,
+    "分子分母同源：都只覆盖跨度内那两行，不是整步 400"
+  );
 });
 
 test("SessionTracker: 单块回复无法拆分 decode，decodeTps 为 null", () => {
@@ -744,6 +750,43 @@ test("SessionTracker: 本轮步数 = 该轮的步记录个数", () => {
   ]);
   const r2 = new core.SessionTracker(multi).start().latestRound({ force: true });
   assert.equal(r2.calls, 3, "三个 message.id = 三步，与是否带 usage 无关");
+});
+
+test("SessionTracker: 大首块不会让 decode 虚高（分子分母必须同源）", () => {
+  // 回归测试：实测某步在 13.9s 里生成了一块 5904 字符的 thinking，
+  // 而这块是**生成完才落盘**的 —— 它的时间戳只是落盘那一刻，生成时间在日志里
+  // 没有对应事件。于是「首块→末块」这个跨度只覆盖后面的两个小 tool_use（794ms）。
+  //
+  // 旧实现拿**整步**的 1837 token 当分子 → 1837/0.794 ≈ 2314 tok/s（该 provider
+  // 正常值约 200）。把首块那部分按字符权重排除后 ≈ 195 tok/s。
+  const dir = fs.mkdtempSync(path.join(tmpRoot, "bigfirst-"));
+  const file = path.join(dir, "bf.jsonl");
+  const t0 = Date.parse("2026-01-01T00:00:00Z");
+  const line = (ms, blocks, usage) =>
+    JSON.stringify({
+      type: "assistant",
+      timestamp: new Date(t0 + ms).toISOString(),
+      message: { id: "m", role: "assistant", content: blocks, usage },
+    }) + "\n";
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ type: "user", timestamp: new Date(t0).toISOString(), message: { role: "user", content: "p" } }) +
+      "\n" +
+      // 首块：13955ms 才落盘的大 thinking
+      line(13955, [{ type: "thinking", thinking: "x".repeat(5904) }], { output_tokens: 1837 }) +
+      line(14730, [{ type: "tool_use", input: { a: "y".repeat(229) } }], { output_tokens: 1837 }) +
+      line(14749, [{ type: "tool_use", input: { a: "y".repeat(297) } }], { output_tokens: 1837 }),
+    "utf8"
+  );
+
+  const r = new core.SessionTracker(file).start().latestRound({ force: true });
+  assert.equal(r.tokens, 1837, "整步 token 仍是全量 —— 那是整轮口径用的");
+  assert.equal(r.decodeMs, 794, "跨度只覆盖首块之后落盘的那两块");
+  assert.ok(
+    r.decodeTps < 400,
+    `同源后应落在合理区间，实际 ${Math.round(r.decodeTps)} tok/s（旧口径会报 2314）`
+  );
+  assert.ok(r.decodeTps > 100, "也不该低到测不出来");
 });
 
 test("SessionTracker: 块被一次性写盘时不报解码速度", () => {
