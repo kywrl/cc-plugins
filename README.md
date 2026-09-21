@@ -52,7 +52,8 @@ API 错误: 3 次 [ECONNRESET×3]，其中 3 次触发了重试
 ## 目录
 
 - [为什么需要它](#为什么需要它)
-- [安装方法](#安装方法)- [hooks 配置方法](#hooks-配置方法)
+- [安装方法](#安装方法)
+- [hooks 配置方法](#hooks-配置方法)
 - [斜杠命令](#斜杠命令)
 - [状态栏集成（可选）](#状态栏集成可选)
 - [环境变量开关](#环境变量开关)
@@ -376,25 +377,50 @@ node plugins/cc-toolkit/scripts/cc-watch.js --json --history=5
 
 输出形如 `⚡ 89 tok/s · 首字 3.2s · 缓存 92%`。
 
-状态栏空间有限，所以它比 hook 那行更简省：不带「整轮」「每秒输出」这类标签，只给数字。
-字段含义与 hook 那行完全一致。用 `CC_TOOLKIT_STATUSLINE_FIELDS` 控制显示哪些段（逗号分隔）：
+状态栏空间有限，所以它比 hook 那行更简省：只有 `tps` 直接给数字（`tok/s` 自带单位），
+其余段用短标签（「每秒输出」缩短成「解码」）。字段含义与 hook 那行相同，用
+`CC_TOOLKIT_STATUSLINE_FIELDS` 控制显示哪些段（逗号分隔）：
 
 - `tps` → `89 tok/s`：整轮速度（含 prefill）
 - `ttft` → `首字 3.2s`：首字等待
 - `decode` → `解码 227`：每秒输出，纯解码（扣掉首字等待，与「首字」正交）
 - `cache` → `缓存 92%`：缓存命中率
-- `median` → `中位 151`：近期中位数
+- `median` → `中位 151`：近 9 条样本的整轮速度中位（不是 decode 中位）
 
-默认 `tps,ttft,cache`。例如只想要一个数字：
+注意 `CC_TOOLKIT_STATUSLINE_FIELDS` 只认这五个名字。hook 的 `CC_TOOLKIT_SHOW` 另外还有
+`tokens` / `thinking` / `model` / `effort` / `skill`，状态栏不渲染 —— 照搬过去不会报错，
+只是那一段不出现。
+
+另有两段附加后缀，不占字段名、每次刷新可能出现也可能不出现：
+
+- `⚠ 截断`（渲染为 `⚠截断`）：本轮被 `max_tokens` 截断，受 `CC_TOOLKIT_ALERTS` 控制；
+- `(缓存中位 92%)`：开了 `median` 且本轮没有缓存读数时，补一段历史缓存中位。
+
+默认 `tps,ttft,cache`。例如只想要一个数字 —— 注意 `tps` 是含 prefill 的整轮口径，
+想看纯生成速度应该选 `decode`：
 
 ```json
-{ "env": { "CC_TOOLKIT_STATUSLINE_FIELDS": "tps" } }
+{ "env": { "CC_TOOLKIT_STATUSLINE_FIELDS": "decode" } }
 ```
 
-如果你已经有自己的状态栏脚本了，不想换掉整个 statusLine，可以让它内部调一下本脚本：
+**读到空输出是正常的**：选中的段可能恰好都取不到 —— 单块回复没有可测的 `decode` 区间、
+没有 usage 的轮次没有 `cache` 可算、或本轮 token 数低于 `CC_TOOLKIT_MIN_TOKENS`。
+这种时候状态栏整段不输出，而不是留一个光秃秃的 `⚡ `。
+
+如果你已经有自己的状态栏脚本了，不想换掉整个 statusLine，可以让它内部调一下本脚本。
+**必须把 Claude Code 传来的 stdin 原样转发进去** —— 脚本要从里面取 `session_id` /
+`transcript_path` 才能定位会话，读不到就直接输出空：
 
 ```bash
-TPS=$(node "/path/to/cc-toolkit/plugins/cc-toolkit/scripts/cc-statusline.js" </dev/null)
+TPS=$(printf '%s' "$INPUT" | node "/path/to/cc-toolkit/plugins/cc-toolkit/scripts/cc-statusline.js")
+```
+
+注意别用 `</dev/null` 做自测：那样脚本拿不到会话信息，永远输出空，
+看起来像状态栏坏了。要验证它有没有工作，喂一段真实的状态栏输入：
+
+```bash
+echo '{"session_id":"<会话id>","transcript_path":"~/.claude/projects/<项目目录名>/<会话id>.jsonl"}' \
+  | node "/path/to/cc-toolkit/plugins/cc-toolkit/scripts/cc-statusline.js"
 ```
 
 ---
@@ -414,13 +440,13 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
 | `CC_TOOLKIT_DISABLE` | — | 设为 `1` 完全禁用（hook 与状态栏都静默退出） |
-| `CC_TOOLKIT_MIN_TOKENS` | `30` | 低于该 token 数不报告，避免"嗯"一声也弹个数。**只作用于本轮读数**，不影响中位数等统计聚合 |
-| `CC_TOOLKIT_SHOW` | `ttft,decode,cache` | 每轮那行包含哪些字段，用 ` \| ` 连接。默认就是三个原始读数。可选 `ttft`（首字等待）`decode`（每秒输出/纯解码）`cache`（缓存命中）`tps`（整轮速度）`median`（近期中位）`tokens`（本轮 token）`thinking` `model` `effort` `skill`。例如只留速度：`CC_TOOLKIT_SHOW=decode,tps` |
-| `CC_TOOLKIT_ALERTS` | 开 | 设为 `0` 关掉附加提示（max_tokens 截断 / refusal / API 重试）。缓存命中率不在此列 —— 它本身就是默认显示的读数之一 |
+| `CC_TOOLKIT_MIN_TOKENS` | `30` | 低于该 token 数不报告，避免"嗯"一声也弹个数。设为 `0` 表示不设下限。**只作用于本轮读数**，不影响中位数等统计聚合 |
+| `CC_TOOLKIT_SHOW` | `ttft,decode,cache` | 每轮那行包含哪些字段，用 ` \| ` 连接。默认就是三个原始读数。可选 `ttft`（首字等待）`decode`（每秒输出/纯解码）`cache`（缓存命中）`tps`（整轮速度）`median`（近 9 条中位）`tokens`（本轮 token）`thinking` `model` `effort` `skill`。例如只留速度：`CC_TOOLKIT_SHOW=decode,tps` |
+| `CC_TOOLKIT_ALERTS` | 开 | 设为 `0` 关掉 hook 与状态栏的截断提示。缓存命中率不在此列 —— 它本身就是默认显示的读数之一。refusal / API 重试这两条只在 hook 里报 |
 | `CC_TOOLKIT_VERBOSE` | — | 设为 `1` 把诊断信息写到 stderr |
 | `CC_TOOLKIT_STATUSLINE_PREFIX` | `⚡ ` | 状态栏前缀 |
-| `CC_TOOLKIT_STATUSLINE_FIELDS` | `tps,ttft,cache` | 状态栏显示哪些段。字段含义同 `CC_TOOLKIT_SHOW`，但状态栏更简省：不带标签、用 ` · ` 连接。可选 `tps`（整轮速度）`ttft`（首字等待）`decode`（每秒输出）`cache`（缓存命中）`median`（近期中位） |
-| `CC_TOOLKIT_STATUSLINE_CACHE_MS` | `45000` | 状态栏缓存有效期（毫秒） |
+| `CC_TOOLKIT_STATUSLINE_FIELDS` | `tps,ttft,cache` | 状态栏显示哪些段，用 ` · ` 连接。可选 `tps`（整轮速度）`ttft`（首字等待）`decode`（每秒输出）`cache`（缓存命中）`median`（近 9 条中位；开启后会附带 `(缓存中位 N%)`）。**只认这五个名字** —— hook 的 `CC_TOOLKIT_SHOW` 另有 `tokens`/`thinking`/`model`/`effort`/`skill`，状态栏不渲染 |
+| `CC_TOOLKIT_STATUSLINE_CACHE_MS` | `45000` | 状态栏缓存有效期（毫秒）。设为 `0` 表示不用缓存，每次刷新都重算 |
 
 只想临时静音一轮，直接在 shell 里 `export CC_TOOLKIT_DISABLE=1` 再启动 Claude Code 即可。
 
@@ -447,7 +473,9 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 | 响应已结束，`usage.output_tokens` 已落盘 | **精确**：真实 token ÷ 真实耗时 | 无标记 |
 | 响应正在流式，usage 还没写 | **估算**：块内容按字符数换算（CJK ≈ 1.5 字符/tok，其余 ≈ 4 字符/tok） | `≈` |
 
-所有输出都用 `≈` 明确区分两者，不会拿估算值冒充精确值。usage 落盘后估算值会被自动替换掉。
+所有输出都用 `≈` 明确区分两者，不会拿估算值冒充精确值。hook 与状态栏一致：
+估算值所在的每一段都带 `≈`（hook 的「每秒输出」与状态栏的「解码」同样如此）。
+usage 落盘后估算值会被自动替换掉。
 
 ### 读数口径，别混着看
 
@@ -470,6 +498,7 @@ hook 是从 Claude Code 进程继承环境的，所以在 `settings.json` 的 `e
 **`每秒输出` 显示为空是正常的**：只有 ≥2 个内容块、且首末块间隔 ≥300ms 才算得出。
 实测 29% 的轮次时间戳只差 1–3ms（Claude Code 把多个块一次性写盘），这种根本没有可测区间，
 插件宁可留空也不报一个上百万 tok/s 的假数字，也不用含 prefill 的整轮速度去顶替它。
+状态栏的 `decode` 段同理；如果它是你选中的唯一一段，这一轮的状态栏就整段不显示。
 
 ### 其他口径
 

@@ -55,8 +55,8 @@ const MIN_SAMPLE_TOKENS = 50;
 const MIN_SAMPLE_MS = 300;
 /** 最多保留多少条已完成样本 */
 const MAX_SAMPLES = 500;
-/** 写入文件缓存的上限 */
-const MAX_CACHE_ENTRIES = 500;
+/** 跨进程缓存格式版本。改字段语义或落盘形状都要 +1，让旧缓存自动失效 */
+const CACHE_VERSION = 3;
 /** TTFT 超过这个值就不当作「等待首字」——多半是用户去接水了，不是模型慢 */
 const MAX_PLAUSIBLE_TTFT_MS = 120_000;
 /**
@@ -823,11 +823,17 @@ class SessionTracker {
    *
    * 这里用 force 收尾：Stop hook 调用本方法时，事件本身就意味着本轮已结束，
    * 没必要再等 3 秒的流式窗口，否则缓存会永远落后一轮。
+   *
+   * **statusline 也必须传 force:true**（cc-statusline.js）：它同样是在「本轮已结束」
+   * 之后才被调用的，不传的话流式窗口内会取到上一轮，还会把上一轮的读数写进缓存。
+   *
+   * 落盘时只留 lastRound + rollup（见 writeCache）：全量 samples 有 270KB 以上，
+   * 而读它的只有 statusline 这一处，它用到的就是这两个字段。
    */
   snapshot({ force = false } = {}) {
     const samples = this.finalizedSamples({ force }).slice(-MAX_SAMPLES);
     return {
-      v: 2,
+      v: CACHE_VERSION,
       file: this.file,
       at: Date.now(),
       parsedLines: this.parsedLines,
@@ -864,21 +870,42 @@ function cacheFileFor(sessionId) {
   return path.join(os.tmpdir(), `cc-toolkit-${sessionId || "default"}.json`);
 }
 
-/** 读缓存；过期（超过 maxAgeMs）或损坏都返回 null。v1 旧缓存不兼容，直接当没有 */
-function readCache(sessionId, maxAgeMs = 12 * 60 * 60 * 1000) {
+/** 读缓存；过期（超过 maxAgeMs）或损坏都返回 null。旧版缓存不兼容，直接当没有 */
+function readCache(sessionId, maxAgeMs = 12 * 60 * 60 * 1000, expectedFile = null) {
   try {
     const raw = JSON.parse(fs.readFileSync(cacheFileFor(sessionId), "utf8"));
-    if (!raw || raw.v !== 2 || !Array.isArray(raw.samples)) return null;
+    // v3 起不再落 samples，只留 lastRound + rollup
+    if (!raw || raw.v !== CACHE_VERSION || !raw.lastRound) return null;
     if (Date.now() - raw.at > maxAgeMs) return null;
+    if (expectedFile && raw.file && raw.file !== expectedFile) return null;
     return raw;
   } catch {
     return null;
   }
 }
 
+/**
+ * 写缓存。只落 statusline 真正会读的字段：
+ *
+ *   lastRound / rollup —— 渲染要用的读数与聚合量
+ *   file / at / v       —— 身份与有效期
+ *
+ * 不落 samples（500 条 ≈ 270KB）与 session（≈450B）：statusline 一个都不用，
+ * 全量写进去只是让每次刷新都多解析 40 倍的数据。lastRound 缺失时直接拒写 ——
+ * 那种快照不含任何读数，写下去会让 readCache 当成有效缓存命中，
+ * 把状态栏空白地锁住整个 TTL。
+ */
 function writeCache(sessionId, snapshot) {
   try {
-    const data = { ...snapshot, samples: (snapshot.samples || []).slice(-MAX_CACHE_ENTRIES) };
+    if (!snapshot || !snapshot.lastRound) return;
+    const data = {
+      v: snapshot.v,
+      file: snapshot.file,
+      at: snapshot.at,
+      parsedLines: snapshot.parsedLines,
+      lastRound: snapshot.lastRound,
+      rollup: snapshot.rollup,
+    };
     fs.writeFileSync(cacheFileFor(sessionId), JSON.stringify(data), "utf8");
   } catch {
     /* 缓存写不进去不影响主流程 */
@@ -1207,6 +1234,7 @@ module.exports = {
   MIN_SAMPLE_TOKENS,
   MIN_SAMPLE_MS,
   MAX_SAMPLES,
+  CACHE_VERSION,
   MAX_ATTRIBUTION_MS,
   MIN_DECODE_MS,
   LOW_CACHE_HIT_RATIO,

@@ -334,19 +334,64 @@ test("缓存：写入后可按 sessionId 读回，过期则失效", () => {
   const id = `cache-${Math.random().toString(36).slice(2)}`;
   assert.equal(core.readCache(id), null, "还没写时应为 null");
 
-  core.writeCache(id, { v: 2, at: Date.now(), samples: [{ tps: 1 }] });
-  assert.deepEqual(core.readCache(id).samples, [{ tps: 1 }]);
+  const lastRound = { tokens: 400, tps: 167, estimated: false };
+  core.writeCache(id, { v: core.CACHE_VERSION, at: Date.now(), file: "/x/a.jsonl", lastRound });
+  const got = core.readCache(id);
+  assert.deepEqual(got.lastRound, lastRound, "lastRound 必须原样读回");
 
   // 过期判定要显式造一个旧时间戳：用 maxAgeMs=0 会依赖「写入与读取至少差 1ms」，
   // 同一毫秒内完成时不会过期，测试会随机失败。
-  core.writeCache(id, { v: 2, at: Date.now() - 10_000, samples: [{ tps: 1 }] });
+  core.writeCache(id, { v: core.CACHE_VERSION, at: Date.now() - 10_000, file: "/x/a.jsonl", lastRound });
   assert.equal(core.readCache(id, 1000), null, "超过 maxAgeMs 应失效");
   assert.notEqual(core.readCache(id, 60_000), null, "未超期则仍可读");
   fs.rmSync(core.cacheFileFor(id), { force: true });
 });
 
-test("缓存：v1 旧格式被拒绝（字段语义已变，宁可不显示也不显示错的）", () => {
-  const id = `cache-v1-${Math.random().toString(36).slice(2)}`;
+test("缓存：没有 lastRound 的快照拒绝落盘（空缓存会把状态栏锁死 TTL）", () => {
+  const id = `cache-blank-${Math.random().toString(36).slice(2)}`;
+  core.writeCache(id, { v: core.CACHE_VERSION, at: Date.now(), samples: [], lastRound: null });
+  assert.equal(fs.existsSync(core.cacheFileFor(id)), false, "空快照不该写文件");
+  assert.equal(core.readCache(id), null);
+});
+
+test("缓存：只落 lastRound 与 rollup，不落全量 samples", () => {
+  const id = `cache-lean-${Math.random().toString(36).slice(2)}`;
+  // statusline 不读 samples，写了只是让每次刷新多解析几十倍的数据
+  core.writeCache(id, {
+    v: core.CACHE_VERSION,
+    at: Date.now(),
+    file: "/x/a.jsonl",
+    samples: [{ tps: 1 }, { tps: 2 }],
+    lastRound: { tokens: 400, tps: 167, estimated: false },
+    rollup: { median: 167, count: 1 },
+    session: { cache: { sampleCount: 2 } },
+  });
+  const raw = JSON.parse(fs.readFileSync(core.cacheFileFor(id), "utf8"));
+  assert.equal(raw.samples, undefined, "samples 不该落盘");
+  assert.equal(raw.session, undefined, "session 不该落盘");
+  assert.deepEqual(raw.rollup, { median: 167, count: 1 }, "rollup 必须保留");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
+test("缓存：file 与期望的 transcript 不符时当作没命中（两个会话不会互相串读数）", () => {
+  const id = `cache-xfile-${Math.random().toString(36).slice(2)}`;
+  const lastRound = { tokens: 400, tps: 800, estimated: false };
+  core.writeCache(id, { v: core.CACHE_VERSION, at: Date.now(), file: "/x/other.jsonl", lastRound });
+  assert.equal(core.readCache(id, 60_000, "/x/mine.jsonl"), null, "不是自己的会话就不该用");
+  assert.notEqual(core.readCache(id, 60_000, "/x/other.jsonl"), null, "自己的会话照常命中");
+  assert.notEqual(core.readCache(id, 60_000), null, "不传期望路径时不做比对");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
+test("缓存：旧版本格式被拒绝（落盘形状已变，宁可不显示也不显示错的）", () => {
+  const id = `cache-old-${Math.random().toString(36).slice(2)}`;
+  // v2 仍带全量 samples 且允许 lastRound 缺失，与现在的读取契约不符
+  fs.writeFileSync(
+    core.cacheFileFor(id),
+    JSON.stringify({ v: 2, at: Date.now(), samples: [{ tps: 999 }] }),
+    "utf8"
+  );
+  assert.equal(core.readCache(id), null, "旧版本缓存必须当作没有");
   fs.writeFileSync(
     core.cacheFileFor(id),
     JSON.stringify({ v: 1, at: Date.now(), samples: [{ tps: 999 }] }),
@@ -853,6 +898,21 @@ test("statusline: v1 旧缓存被忽略后，仍能从 transcript 重算出读�
   fs.rmSync(core.cacheFileFor(id), { force: true });
 });
 
+test("statusline: 精确锁定渲染出的那行，标签漂移能被测出来", () => {
+  // hook 那行有 assert.equal 精确锁定（见「hook: 三个读数|分隔」），
+  // 状态栏这边原来只 match /解码/ —— 改个标签名照样通过。
+  // 顺带钉住「只有 tps 是裸数字，其余带短标签」这条（README 里写错过）。
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }], {
+    name: "sl-exact.jsonl",
+  });
+  patchUsage(file, { input_tokens: 80, cache_read_input_tokens: 920 });
+  const out = run("cc-statusline.js", [], {
+    input: JSON.stringify({ session_id: `sl-exact-${Math.random().toString(36).slice(2)}`, transcript_path: file }),
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "tps,ttft,decode,cache" },
+  });
+  assert.equal(out, "⚡ 167 tok/s · 首字 0.8s · 解码 250 · 缓存 92%");
+});
+
 test("SessionTracker: 拆分首字等待(TTFT)与纯解码速度", () => {
   // 3 个块，每块间隔 800ms：整轮 2.4s / 400 tok = 167 tok/s，
   // 但首字等了 800ms，真正的解码跨度只有 1.6s → 250 tok/s。
@@ -1332,6 +1392,158 @@ test("statusline: CC_TOOLKIT_STATUSLINE_FIELDS 控制显示哪些段", () => {
   assert.match(full, /解码/);
 });
 
+test("statusline: median 开关会带出「(缓存中位 N%)」，且只在有中位数据时出现", () => {
+  // 这段是 median 的副产物（不是独立字段），且用 (...) 而非 · 连接。
+  // 原先文档没写，用户开 median 会莫名多出一段缓存读数。
+  const file = writeTranscript(
+    [
+      { id: "m1", ms: 2400, tokens: 400, chunks: 3 },
+      { id: "m2", ms: 2400, tokens: 400, chunks: 3 },
+    ],
+    { name: "sl-medcache.jsonl" }
+  );
+  patchLines(file, (r) => {
+    if (r.type === "assistant" && r.message && r.message.usage) {
+      // 只有归档那一轮带缓存，最后一轮的 usage 不带 → lastRound.cache 为空
+      r.message.usage = { output_tokens: 400 };
+    }
+    return r;
+  });
+  // 手工补一条带 cache 的样本进缓存，模拟「历史轮次有缓存、本轮没有」
+  const id = `sl-medcache-${Math.random().toString(36).slice(2)}`;
+  core.writeCache(id, {
+    v: core.CACHE_VERSION,
+    at: Date.now(),
+    file,
+    lastRound: { tokens: 400, tps: 167, decodeTps: 250, ttftMs: 800, ttftMeaningful: true, estimated: false, cache: null, stoppedByLimit: false },
+    rollup: { median: 167, count: 1, medianCacheHit: 0.9 },
+  });
+  const out = run("cc-statusline.js", [], {
+    input: JSON.stringify({ session_id: id, transcript_path: file }),
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "median" },
+  });
+  assert.equal(out, "⚡ 中位 167 (缓存中位 90%)");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
+test("statusline: 选中的字段都取不到时输出空，而不是只剩一个前缀", () => {
+  // 单块回复没有任何可测的解码区间 → decode 段为空。
+  // 原来会吐出 "⚡ "，读者分不清这是「字段名拼错了」还是「本轮的取不到」。
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 1 }], { name: "sl-empty.jsonl" });
+  const out = run("cc-statusline.js", [], {
+    input: JSON.stringify({ session_id: "sl-empty", transcript_path: file }),
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "decode" },
+  });
+  assert.equal(out, "", "没有可展示的段就什么都别输出");
+
+  // 拼错的字段名同理
+  const typo = run("cc-statusline.js", [], {
+    input: JSON.stringify({ session_id: "sl-empty", transcript_path: file }),
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "tpss" },
+  });
+  assert.equal(typo, "");
+});
+
+test("statusline: MIN_TOKENS=0 / CACHE_MS=0 是有意义的取值，不被默认值顶掉", () => {
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 18 }], { name: "sl-zero.jsonl" });
+  const input = JSON.stringify({ session_id: `sl-zero-${Math.random().toString(36).slice(2)}`, transcript_path: file });
+
+  assert.notEqual(
+    run("cc-statusline.js", [], { input, env: { CC_TOOLKIT_MIN_TOKENS: "0" } }),
+    "",
+    "0 表示全显示，不该被换回 30"
+  );
+  assert.equal(run("cc-statusline.js", [], { input }), "", "默认 30 时 18 tok 仍然静默");
+
+  // CACHE_MS=0 = 不用缓存 → 每次都走重算路径，而不是被换成 45000。
+  // 一轮要能显示得先过 MIN_TOKENS，所以两个都设 0 / 1。
+  assert.notEqual(
+    run("cc-statusline.js", [], {
+      input,
+      env: { CC_TOOLKIT_MIN_TOKENS: "1", CC_TOOLKIT_STATUSLINE_CACHE_MS: "0" },
+    }),
+    ""
+  );
+});
+
+test("statusline: 流式窗口内也取本轮，不报上一轮", () => {
+  // 上一轮快得多；若误取上一轮，读数会明显偏高。
+  // 状态栏只在回复结束后刷新，本轮必然已结束，所以必须传 force。
+  const file = writeTranscript(
+    [
+      { id: "m1", ms: 800, tokens: 600 }, // 750 tok/s
+      { id: "m2", ms: 4000, tokens: 400 }, // 100 tok/s
+    ],
+    { name: "sl-latest.jsonl" }
+  );
+  const out = run("cc-statusline.js", [], {
+    input: JSON.stringify({ session_id: `sl-latest-${Math.random().toString(36).slice(2)}`, transcript_path: file }),
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "tps" },
+  });
+  assert.match(out, /⚡ 100 tok\/s/, "应为最后一轮的速度，不是上一轮");
+});
+
+test("statusline: 估算值的 ≈ 标记与 hook 一致（包括解码段）", () => {
+  // 最后一轮没有 usage → estimated，整轮与解码都该带 ≈
+  const file = writeTranscript(
+    [
+      { id: "m1", ms: 2400, tokens: 400, chunks: 3 },
+      { id: "m2", ms: 2400, tokens: 400, chunks: 3, usage: false },
+    ],
+    { name: "sl-est.jsonl" }
+  );
+  const input = JSON.stringify({ session_id: `sl-est-${Math.random().toString(36).slice(2)}`, transcript_path: file });
+  const out = run("cc-statusline.js", [], {
+    input,
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "tps,decode" },
+  });
+  assert.match(out, /≈\d+ tok\/s/, "整轮要带 ≈");
+  assert.match(out, /解码 ≈\d+/, "解码段同样要带 ≈，不能把估算值当精确值");
+
+  // hook 在同一轮上也要带 ≈，两边的标记位置必须一致
+  const hookOut = JSON.parse(run("cc-hook.js", [], { input: JSON.stringify({ ...JSON.parse(input), hook_event_name: "Stop" }) }));
+  assert.match(hookOut.systemMessage, /每秒输出 ≈\d+ tok\/s/);
+});
+
+test("statusline: 慢轮的读数不四舍五入成 0", () => {
+  // 65 tok / 197s = 0.33 tok/s。抹成 0 等于报一个从没测到的数字。
+  const file = writeTranscript([{ id: "m", ms: 197_000, tokens: 65 }], { name: "sl-slow.jsonl" });
+  const out = run("cc-statusline.js", [], {
+    input: JSON.stringify({ session_id: `sl-slow-${Math.random().toString(36).slice(2)}`, transcript_path: file }),
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "tps" },
+  });
+  assert.doesNotMatch(out, /0 tok\/s/, "慢轮不该显示 0 tok/s");
+  assert.match(out, /⚡ 0\.3 tok\/s/, "应保留一位小数");
+});
+
+test("statusline: ALERTS=0 也管住 ⚠截断", () => {
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }], { name: "sl-trunc.jsonl" });
+  patchLines(file, (r) => {
+    if (r.type === "assistant" && r.message) r.message.stop_reason = "max_tokens";
+    return r;
+  });
+  const input = JSON.stringify({ session_id: `sl-trunc-${Math.random().toString(36).slice(2)}`, transcript_path: file });
+
+  assert.match(run("cc-statusline.js", [], { input }), /⚠截断/, "默认应提示截断");
+  assert.doesNotMatch(
+    run("cc-statusline.js", [], { input, env: { CC_TOOLKIT_ALERTS: "0" } }),
+    /⚠截断/,
+    "ALERTS=0 时状态栏也不该提示"
+  );
+});
+
+test("statusline: 缓存里不落 samples，且不带 lastRound 的快照不落盘", () => {
+  const id = `sl-lean-${Math.random().toString(36).slice(2)}`;
+  const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }], { name: "sl-lean.jsonl" });
+  run("cc-statusline.js", [], { input: JSON.stringify({ session_id: id, transcript_path: file }) });
+
+  const raw = JSON.parse(fs.readFileSync(core.cacheFileFor(id), "utf8"));
+  assert.equal(raw.samples, undefined, "statusline 不读 samples，不该落盘");
+  assert.ok(raw.lastRound, "lastRound 必须在");
+  assert.ok(raw.file, "file 必须在，供读取方比对会话身份");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
 test("statusline: 空 stdin 与禁用开关都安全退出", () => {
   assert.equal(run("cc-statusline.js", [], { input: "" }), "");
   assert.equal(
@@ -1369,21 +1581,31 @@ test("doctor: 正常退出并打印检查项", () => {
  * 于是「命令跑一下就 MODULE_NOT_FOUND」能一路活到发布。
  */
 const PLUGIN_ROOT = path.join(__dirname, "..");
+/** 仓库根。plugin.json / marketplace.json 里的描述也面向用户，同样要检查 */
+const REPO_ROOT = path.join(PLUGIN_ROOT, "..", "..");
 
-/** 递归收集插件目录下的文件，跳过运行时残留与隐藏目录。 */
-function collectFiles(dir) {
+/**
+ * 递归收集文件，跳过运行时残留。
+ * includeDotDirs=true 时连 .claude-plugin/ 一起收 —— 那里面就是面向用户的描述文案，
+ * 恰恰是最容易漏改的地方。
+ */
+function collectFiles(dir, { includeDotDirs = false } = {}) {
   const out = [];
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name.startsWith(".")) continue;
+    if (e.name.startsWith(".") && !includeDotDirs) continue;
+    if (e.name === "node_modules" || e.name === ".git") continue;
     const p = path.join(dir, e.name);
-    if (e.isDirectory()) out.push(...collectFiles(p));
+    if (e.isDirectory()) out.push(...collectFiles(p, { includeDotDirs }));
     else if (e.isFile()) out.push(p);
   }
   return out;
 }
 
 test("引用完整性: 命令 / hooks / 文档里提到的脚本都真实存在", () => {
-  const files = collectFiles(PLUGIN_ROOT).filter((f) => /\.(md|json|js|sh)$/.test(f));
+  // 带 .claude-plugin/：plugin.json 的描述面向用户，和 .md 一样会过期
+  const files = collectFiles(PLUGIN_ROOT, { includeDotDirs: true }).filter((f) =>
+    /\.(md|json|js|sh)$/.test(f)
+  );
   const re = /(?:scripts|commands)\/[A-Za-z0-9._-]+\.(?:js|sh|json|md)/g;
 
   const missing = [];
@@ -1397,6 +1619,81 @@ test("引用完整性: 命令 / hooks / 文档里提到的脚本都真实存在"
   }
 
   assert.deepEqual(missing, [], `下列引用指向不存在的文件：\n${missing.join("\n")}`);
+});
+
+/**
+ * 词表一致性：2.0.0 把每轮那行收敛成「首字 / 每秒输出 / 缓存命中」，
+ * 50+ 个文件里逐处手抄的说明就不可能靠人记住去改 —— 实测 marketplace 条目、
+ * 插件 README、脚本头注释在改名后各自漏了一处，且没有任何测试能发现。
+ * 这份清单是「已废弃的说法」，出现在面向用户的描述文案里就算回归。
+ *
+ * CHANGELOG 不查：它是历史记录，必须能原样引用被删掉的旧格式来说明改了什么。
+ * 本文件也不查：下面的正则字面量本身就含这些模式。
+ */
+test("词表一致性: 文档与描述里不再出现已废弃的说法", () => {
+  const retired = [
+    // 2.0.0 去掉了 `⚡ 本轮 11 tok/s / 3.8s` 这个前缀形式。
+    // 两个模式一起用：`⚡ 本轮` 钉输出格式，`本轮速度` 钉「把本轮速度当成一个
+    // 读数名来宣传」的文案。后者要排除代码注释里泛指本轮的普通说法
+    //（「本轮速度能不能显示」），所以用否定前瞻。
+    { re: /⚡ 本轮/, why: "2.0.0 去掉了 `⚡ 本轮` 前缀，改用首字/每秒输出/缓存命中" },
+    {
+      re: /本轮速度(?!能不能|是否|能否)/,
+      why: "2.0.0 起不再报「本轮速度」这个合成读数（已拆成首字/每秒输出/缓存命中）",
+    },
+    // 描述状态栏时把 decode 说成裸数字，实际只有 tps 不带标签
+    { re: /不带标签[，,]只给数字/, why: "5 个状态栏字段里只有 tps 不带标签，其余带短标签" },
+    // 缓存位置写错过
+    { re: /~\/\.tmp\/cc-toolkit-/, why: "缓存实际落在 os.tmpdir()，不是 ~/.tmp" },
+  ];
+
+  const files = [
+    ...collectFiles(PLUGIN_ROOT, { includeDotDirs: true }),
+    ...collectFiles(REPO_ROOT, { includeDotDirs: true }).filter((f) =>
+      /(?:^|\/)(?:README|CHANGELOG)\.md$/.test(f) ||
+      /\.claude-plugin\/[^/]+\.json$/.test(f)
+    ),
+  ].filter(
+    (f) =>
+      /\.(md|json|js)$/.test(f) &&
+      !/CHANGELOG\.md$/.test(f) &&
+      path.resolve(f) !== path.resolve(__filename)
+  );
+
+  const hits = [];
+  for (const file of files) {
+    const text = fs.readFileSync(file, "utf8");
+    for (const { re, why } of retired) {
+      const m = text.match(re);
+      if (m) hits.push(`${path.relative(REPO_ROOT, file)} 出现 ${JSON.stringify(m[0])} —— ${why}`);
+    }
+  }
+
+  assert.deepEqual(hits, [], `已废弃的说法又出现了：\n${hits.join("\n")}`);
+});
+
+/**
+ * 状态栏字段表：README 列的名字必须与渲染器实际认的名字一致。
+ * 上一次是 README 说「字段含义同 CC_TOOLKIT_SHOW」，实际只实现 5 个，
+ * 用户照搬 tokens/model 只会得到一行空白。
+ */
+test("词表一致性: README 的状态栏字段表与渲染器一致", () => {
+  const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
+  const src = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "cc-statusline.js"), "utf8");
+
+  // 渲染器实际认的字段：fields.has("x") 出现在渲染段里
+  const implemented = new Set([...src.matchAll(/fields\.has\("([a-z]+)"\)/g)].map((m) => m[1]));
+  assert.ok(implemented.size >= 5, `没解析出状态栏字段，正则需要更新：${[...implemented]}`);
+
+  // README 的状态栏字段列表：抓 `- \`name\` → ` 这种 bullet
+  const section = readme.split("## 状态栏集成")[1] || "";
+  const listed = new Set([...section.matchAll(/^- `([a-z]+)` → /gm)].map((m) => m[1]));
+
+  assert.deepEqual(
+    [...listed].sort(),
+    [...implemented].sort(),
+    "README 的状态栏字段列表必须与 cc-statusline.js 的实现完全一致"
+  );
 });
 
 test("引用完整性: 命令与 hooks 只调用 scripts/ 下实际存在的入口", () => {

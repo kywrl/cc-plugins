@@ -122,7 +122,9 @@ async function main() {
   if (!tracker) return silent("定位不到会话文件");
 
   const sessionId = event.session_id || require("path").basename(tracker.file).replace(/\.jsonl$/, "");
-  const minTokens = parseInt(env.CC_TOOLKIT_MIN_TOKENS || "30", 10) || 30;
+  // 显式给定的 0 有意义（MIN_TOKENS=0 = 全显示），不能用 `|| 默认值` 一起换掉
+  const minTokensRaw = parseInt(env.CC_TOOLKIT_MIN_TOKENS, 10);
+  const minTokens = Number.isFinite(minTokensRaw) && minTokensRaw >= 0 ? minTokensRaw : 30;
   const alertsOn = env.CC_TOOLKIT_ALERTS !== "0";
   const show = new Set(
     (env.CC_TOOLKIT_SHOW || "ttft,decode,cache")
