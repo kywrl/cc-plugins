@@ -8,9 +8,11 @@
  *   2. 缓存缺失或过期 → 只回放 transcript 末尾 400KB 重算一次，然后写回缓存。
  * 绝不做全量回放；缓存里只存 lastRound 与预先算好的聚合量，本身不遍历样本。
  *
- * 400KB 这个切点可能落在某一轮的用户行与首个内容块之间，那一轮的起点锚就丢了 ——
- * core 会把这种轮次标成 truncatedAnchor：不显示首字，也不让它进统计聚合
- *（详见 cc-core.js 的 _describe）。hook 走默认的 2MB，基本碰不到这种情况。
+ * 400KB 这个切点可能落在某一轮的用户行与首个内容块之间，那一轮的起点锚就丢了。
+ * core 会把这种轮次标成 truncatedAnchor；本脚本随后用上一份快照里同一轮
+ *（按 at 末块时间戳匹配）的 ttft / start 把值补回来，所以读数与 hook 一致。
+ * 只有从未算准过（冷启动、无缓存）时才留空 —— 不显示，也不编一个值。
+ * hook 走默认的 2MB，基本碰不到这种情况。
  *
  * 用法（放进 settings.json 的 statusLine.command）:
  *   node "${CLAUDE_PLUGIN_ROOT}/scripts/cc-statusline.js"
@@ -79,6 +81,7 @@ function main() {
   // ① 优先用缓存（最新一轮 + 预先算好的聚合量）
   let last = null;
   let rollup = null;
+  let prevRound = null; // 上一份快照里的读数，用来补回窗口切掉的锚点
   const cached = sessionId ? core.readCache(sessionId, cacheMs, input.transcript_path || null) : null;
   if (cached) {
     last = cached.lastRound || null;
@@ -87,14 +90,35 @@ function main() {
     // ② 缓存过期：只回放末尾 400KB，并顺手把聚合量一起算好写回。
     // force:true —— 状态栏只在模型回完话之后才被刷新，本轮已经结束；
     // 不传的话流式窗口内会取到上一轮，还会把上一轮的读数写进缓存。
+    //
+    // 先取一份过期缓存（不看 TTL）：这一版回放窗口小，可能恰好切掉某一轮的
+    // 起点锚，而那份锚点是 hook 用 2MB 窗口算准了的 —— 见下面的补回逻辑。
+    prevRound = core.readCache(sessionId, Infinity, input.transcript_path || null)?.lastRound || null;
+
     const tracker = new core.SessionTracker(input.transcript_path).start({ replayTailBytes: 400_000 });
     last = tracker.latestRound({ force: true });
+    // 起点锚被 400KB 切点切掉时，整轮耗时 / 首字都算不出来。
+    // 「首字等待」一轮只发生一次（core 里由 firstBlockAt == null 守着只记一次），
+    // 而 at（末块时间戳）与 start（起点锚）跨窗口稳定 —— 所以只要还是同一轮，
+    // 就有确切的值可补，不必退化成「测不出来」。
+    if (last && last.truncatedAnchor && prevRound && prevRound.at === last.at) {
+      const durMs = Math.max(0, last.at - prevRound.start);
+      last = {
+        ...last,
+        start: prevRound.start,
+        durMs,
+        tps: durMs > 0 ? last.tokens / (durMs / 1000) : last.tps,
+        ttftMs: prevRound.ttftMs,
+        ttftMeaningful: prevRound.ttftMeaningful,
+      };
+    }
     rollup = tracker.rollup(tracker.recentSamples(undefined, { force: true }));
     // 没有可读的轮次就别写缓存：空白快照会被 readCache 当成有效命中，
     // 把状态栏空白地锁住整个 TTL。
     if (last && sessionId) {
       try {
-        core.writeCache(sessionId, tracker.snapshot({ force: true }));
+        // 写回的也必须是补好的那一份，否则下一次刷新命中缓存后又退回「测不出来」
+        core.writeCache(sessionId, { ...tracker.snapshot({ force: true }), lastRound: last });
       } catch {
         /* ignore */
       }

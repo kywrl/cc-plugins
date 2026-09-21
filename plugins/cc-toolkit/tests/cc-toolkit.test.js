@@ -1599,6 +1599,154 @@ test("statusline: 流式窗口内也取本轮，不报上一轮", () => {
   assert.match(out, /⚡ 100 tok\/s/, "应为最后一轮的速度，不是上一轮");
 });
 
+/**
+ * 造一个「长工具轮」：用户行之后夹着大量工具结果，使本轮的用户行距文件末尾
+ * 远超 400KB。这正是状态栏的 400KB 切点会切断起点锚的真实形态。
+ * 返回 { file, userLineBytes }。
+ */
+function writeLongToolRound({ name }) {
+  const dir = fs.mkdtempSync(path.join(tmpRoot, "longtool-"));
+  const file = path.join(dir, name);
+  const lines = [];
+  let t = Date.parse("2026-01-01T00:00:00Z");
+
+  // 先铺历史轮次把文件撑到 400KB 以上
+  for (let k = 0; k < 60; k++) {
+    lines.push(JSON.stringify({ type: "user", timestamp: new Date(t).toISOString(), message: { role: "user", content: "p" } }));
+    for (let i = 0; i < 3; i++) {
+      t += 800;
+      lines.push(
+        JSON.stringify({
+          type: "assistant",
+          timestamp: new Date(t).toISOString(),
+          message: { id: `pad${k}`, role: "assistant", content: [{ type: "text", text: "P".repeat(2000) }], usage: i === 2 ? { output_tokens: 400 } : undefined },
+        })
+      );
+    }
+  }
+
+  // 本轮：用户行 → 等 3s 才有首块 → 120 个工具往返，整轮约 48s
+  const userLine = JSON.stringify({ type: "user", timestamp: new Date(t).toISOString(), message: { role: "user", content: "p" } });
+  lines.push(userLine);
+  t += 3000;
+  for (let i = 0; i < 120; i++) {
+    t += 200;
+    lines.push(JSON.stringify({ type: "user", timestamp: new Date(t).toISOString(), message: { role: "user", content: [{ type: "tool_result", content: "R".repeat(6000) }] } }));
+    t += 200;
+    lines.push(
+      JSON.stringify({
+        type: "assistant",
+        timestamp: new Date(t).toISOString(),
+        message: { id: "LONG", role: "assistant", content: [{ type: "text", text: "x".repeat(2000) }], usage: i === 119 ? { output_tokens: 4000 } : undefined },
+      })
+    );
+  }
+
+  fs.writeFileSync(file, lines.join("\n") + "\n", "utf8");
+  return { file, userLineBytes: Buffer.byteLength(userLine, "utf8") };
+}
+
+test("statusline: 400KB 切点切断起点锚时，用缓存里同一轮的读数补回首字", () => {
+  // 「首字等待」一轮只发生一次（core 里由 firstBlockAt == null 守着只记一次），
+  // 而 at（末块时间戳）跨窗口稳定 —— 只要还是同一轮就有确切值可补，
+  // 不该退化成「测不出来」。
+  const { file } = writeLongToolRound({ name: "sl-anchor.jsonl" });
+  const id = `sl-anchor-${Math.random().toString(36).slice(2)}`;
+  const input = JSON.stringify({ session_id: id, transcript_path: file });
+  const FIELDS = { CC_TOOLKIT_STATUSLINE_FIELDS: "tps,ttft" };
+
+  // hook 走 2MB 窗口，看得到锚点 → 拿到正确读数并写缓存
+  const hookOut = JSON.parse(
+    run("cc-hook.js", [], { input: JSON.stringify({ ...JSON.parse(input), hook_event_name: "Stop" }) })
+  );
+  assert.match(hookOut.systemMessage, /首字 \d+\.\d+s/, "hook 应报出首字");
+  const truth = /首字 (\d+\.\d+)s/.exec(hookOut.systemMessage)[1];
+
+  // 状态栏命中缓存：与 hook 一致
+  const warm = run("cc-statusline.js", [], { input, env: FIELDS });
+  assert.match(warm, new RegExp(`首字 ${truth}s`), "读缓存时应与 hook 一致");
+
+  // 缓存过期后状态栏自己重算（只回放 400KB，锚点被切）——
+  // 必须从过期快照里同一轮补回，而不是报 0.0s 或整段消失
+  const cold = run("cc-statusline.js", [], {
+    input,
+    env: { ...FIELDS, CC_TOOLKIT_STATUSLINE_CACHE_MS: "1" },
+  });
+  assert.match(cold, new RegExp(`首字 ${truth}s`), "锚点被切时应从缓存补回同一轮的首字");
+  assert.doesNotMatch(cold, /首字 0\.0s/, "绝不能报 0.0s");
+
+  // 而且补回的值要写回缓存，否则下一次刷新又退回「测不出来」
+  const cached = JSON.parse(fs.readFileSync(core.cacheFileFor(id), "utf8"));
+  assert.equal(Math.round(cached.lastRound.ttftMs / 100) / 10, Number(truth), "补回的首字要落盘");
+  assert.ok(!cached.lastRound.truncatedAnchor || cached.lastRound.ttftMs != null, "首字不该再是 null");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
+test("statusline: 补回首字时整轮速度也要修正（同一处锚点缺失导致的偏高）", () => {
+  // durMs 也少了同一段首字等待，所以 tps 会偏高 —— 必须与 hook 对齐，
+  // 否则状态栏看起来比 hook 快一倍。
+  const { file } = writeLongToolRound({ name: "sl-anchor2.jsonl" });
+  const id = `sl-anchor2-${Math.random().toString(36).slice(2)}`;
+  const input = JSON.stringify({ session_id: id, transcript_path: file });
+
+  const hookOut = JSON.parse(
+    run("cc-hook.js", [], {
+      input: JSON.stringify({ ...JSON.parse(input), hook_event_name: "Stop" }),
+      env: { CC_TOOLKIT_SHOW: "tps" },
+    })
+  );
+  const truth = Number(/整轮 ≈?(\d+) tok\/s/.exec(hookOut.systemMessage)[1]);
+
+  const cold = run("cc-statusline.js", [], {
+    input,
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "tps", CC_TOOLKIT_STATUSLINE_CACHE_MS: "1" },
+  });
+  const got = Number(/⚡ ≈?(\d+) tok\/s/.exec(cold)[1]);
+  assert.equal(got, truth, "锚点被切时 tps 也要用补回的起点重算，不能偏高");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
+test("statusline: 没有可补的快照时不凭空造首字（冷启动 + 锚点被切）", () => {
+  // 什么都没算出来时不能编 —— 与「decode 测不出来就留空」同一个原则。
+  const { file } = writeLongToolRound({ name: "sl-anchor3.jsonl" });
+  const id = `sl-anchor3-${Math.random().toString(36).slice(2)}`;
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+
+  const out = run("cc-statusline.js", [], {
+    input: JSON.stringify({ session_id: id, transcript_path: file }),
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "tps,ttft" },
+  });
+  assert.doesNotMatch(out, /首字/, "没有可补的值就不该显示首字段");
+  assert.doesNotMatch(out, /首字 0\.0s/, "更不能报 0.0s");
+  assert.match(out, /tok\/s/, "能测出来的那段照常显示");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
+test("statusline: 缓存里是别的轮时不借它的首字", () => {
+  // at 对不上就说明不是同一轮，借用会张冠李戴。
+  const { file } = writeLongToolRound({ name: "sl-anchor4.jsonl" });
+  const id = `sl-anchor4-${Math.random().toString(36).slice(2)}`;
+  core.writeCache(id, {
+    v: core.CACHE_VERSION,
+    at: Date.now() - 999_999, // 过期
+    file,
+    rollup: null,
+    lastRound: {
+      tokens: 400, tps: 400, at: 12345, start: 1, // 与真实轮次的 at 对不上
+      ttftMs: 9999, ttftMeaningful: true, estimated: false,
+      cache: null, stoppedByLimit: false, decodeTps: null, blocks: 2,
+    },
+  });
+
+  const out = run("cc-statusline.js", [], {
+    input: JSON.stringify({ session_id: id, transcript_path: file }),
+    env: { CC_TOOLKIT_STATUSLINE_FIELDS: "tps,ttft" },
+  });
+  assert.doesNotMatch(out, /10\.0s/, "不该借用另一轮的 9999ms");
+  assert.doesNotMatch(out, /首字 0\.0s/, "也不该报 0.0s");
+  fs.rmSync(core.cacheFileFor(id), { force: true });
+});
+
 test("statusline: 估算值的 ≈ 标记与 hook 一致（包括解码段）", () => {
   // 最后一轮没有 usage → estimated，整轮与解码都该带 ≈
   const file = writeTranscript(
