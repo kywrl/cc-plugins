@@ -3,7 +3,7 @@
  * cc-core.js — Claude Code 会话输出速度 (tok/s) 计算引擎
  *
  * 这是 cc-toolkit 插件的核心。它被三个入口复用：
- *   scripts/cc-toolkit.js      (CLI: 实时 / --once / --report / --json)
+ *   scripts/cc-watch.js      (CLI: 实时 / --once / --report / --json)
  *   scripts/cc-hook.js       (Stop hook: 把速度作为 systemMessage 回吐给用户)
  *   scripts/cc-statusline.js (statusline: 单行摘要)
  *

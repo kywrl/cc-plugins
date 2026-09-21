@@ -637,7 +637,7 @@ claude plugin validate .
 claude plugin details cc-toolkit
 ```
 
-（正常应显示 `Skills (3)` + `Hooks (1) Stop`，且 Stop hook 标注为 `harness-only — no model context cost`。）
+（正常应显示 `Skills (4)` + `Hooks (1) Stop`，且 Stop hook 标注为 `harness-only — no model context cost`。）
 
 hook 的调试开关：
 

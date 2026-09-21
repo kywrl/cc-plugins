@@ -4,6 +4,26 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.1] - 2026-09-21
+
+上一次改名（`tps-*` → `cc-*`）把脚本文件改了名，却漏掉了字符串里的路径。
+代码里的 `require` 会立刻报错，但斜杠命令里的路径只在该命令被调用时才炸，
+于是坏引用一路活到了发布。这一版修掉并加上防回归检查。
+
+### 修复
+
+- **`/cc-toolkit:tps-doctor` 一跑就报 `MODULE_NOT_FOUND`。** 命令调的是改名前的
+  `scripts/tps-doctor.js`，实际文件早已是 `cc-doctor.js`。现在改为正确路径。
+- README 里「`claude plugin details` 正常应显示 `Skills (3)`」与实际组件数
+  （4 个：`install-hook` / `tps` / `tps-doctor` / `tps-live`）不符，已更正为 `Skills (4)`。
+- `cc-core.js` 头部注释把 CLI 入口写成 `scripts/cc-toolkit.js`，实际是 `cc-watch.js`。
+
+### 新增测试
+
+- **引用完整性检查**：扫描插件内所有 `.md` / `.json` / `.js` / `.sh` 里出现的
+  `scripts/...` 路径，逐个确认文件存在；另校验命令与 hooks 只调用 `scripts/`
+  下真实的入口，且脚本命名遵循 `cc-` 前缀。这类坏引用不再需要靠手工跑一次命令才发现。
+
 ## [1.1.0] - 2026-09-20
 
 这一版把「一个 tok/s」拆成能分别回答不同问题的几个数字，并开始把会话日志里的旁路信息

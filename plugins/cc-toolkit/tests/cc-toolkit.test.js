@@ -1344,3 +1344,63 @@ test("doctor: 正常退出并打印检查项", () => {
   assert.match(out, /Node\.js/);
   assert.match(out, /Stop hook/);
 });
+
+// ── 组件引用完整性 ──────────────────────────────────────────────────────
+
+/**
+ * 改名（tps-core → cc-core 那一次）最容易漏的不是代码，是字符串里的路径：
+ * 代码里的 require 会立刻报错，而 .md 里的脚本路径只在该命令被调用时才炸，
+ * 于是「命令跑一下就 MODULE_NOT_FOUND」能一路活到发布。
+ */
+const PLUGIN_ROOT = path.join(__dirname, "..");
+
+/** 递归收集插件目录下的文件，跳过运行时残留与隐藏目录。 */
+function collectFiles(dir) {
+  const out = [];
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (e.name.startsWith(".")) continue;
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...collectFiles(p));
+    else if (e.isFile()) out.push(p);
+  }
+  return out;
+}
+
+test("引用完整性: 命令 / hooks / 文档里提到的脚本都真实存在", () => {
+  const files = collectFiles(PLUGIN_ROOT).filter((f) => /\.(md|json|js|sh)$/.test(f));
+  const re = /(?:scripts|commands)\/[A-Za-z0-9._-]+\.(?:js|sh|json|md)/g;
+
+  const missing = [];
+  for (const file of files) {
+    const text = fs.readFileSync(file, "utf8");
+    for (const ref of text.match(re) || []) {
+      if (!fs.existsSync(path.join(PLUGIN_ROOT, ref))) {
+        missing.push(`${path.relative(PLUGIN_ROOT, file)} → ${ref}`);
+      }
+    }
+  }
+
+  assert.deepEqual(missing, [], `下列引用指向不存在的文件：\n${missing.join("\n")}`);
+});
+
+test("引用完整性: 命令与 hooks 只调用 scripts/ 下实际存在的入口", () => {
+  const available = new Set(fs.readdirSync(SCRIPTS));
+  const named = new Set();
+
+  for (const f of collectFiles(path.join(PLUGIN_ROOT, "commands")).concat(
+    collectFiles(path.join(PLUGIN_ROOT, "hooks"))
+  )) {
+    for (const m of fs.readFileSync(f, "utf8").matchAll(/scripts\/([A-Za-z0-9._-]+\.js)/g)) {
+      named.add(m[1]);
+    }
+  }
+
+  const unknown = [...named].filter((n) => !available.has(n));
+  assert.deepEqual(unknown, [], `命令 / hook 调用了不存在的脚本：${unknown.join(", ")}`);
+  assert.ok(named.size > 0, "没扫到任何脚本引用，说明扫描逻辑失效了");
+});
+
+test("引用完整性: plugins 目录下的脚本名遵循 cc- 前缀", () => {
+  const strays = fs.readdirSync(SCRIPTS).filter((f) => f.endsWith(".js") && !f.startsWith("cc-"));
+  assert.deepEqual(strays, [], `脚本命名应为 cc-*.js，实际有：${strays.join(", ")}`);
+});
