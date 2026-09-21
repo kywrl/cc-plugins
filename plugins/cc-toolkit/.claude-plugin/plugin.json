@@ -1,6 +1,6 @@
 {
   "name": "cc-toolkit",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "实时监控 Claude Code 的输出速度 (tok/s)，并把首字等待(TTFT)与纯解码速度分开报。装好即在每轮回复后显示「首字 / 每秒输出 / 缓存命中」三个读数；另带斜杠命令查看历史分布、趋势、分层归因（按 effort/模型/技能/MCP 对比），可选状态栏集成。",
   "author": {
     "name": "kywrl",
