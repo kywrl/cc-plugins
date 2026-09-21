@@ -4,10 +4,10 @@
  * cc-hook — Stop hook：每轮回复结束后，把本轮输出速度回吐给用户
  *
  * 在 stdin 收到 Claude Code 的 Stop 事件 JSON，往 stdout 吐
- *   {"systemMessage": "首字 0.8s | 每秒输出 68 tok/s | 缓存命中 92%"}
+ *   {"systemMessage": "12 步 | 每秒输出 68 tok/s | 缓存命中 92%"}
  * systemMessage 只展示给用户，不会进入模型上下文（不污染对话、不花 token）。
  *
- * 只给三个原始读数，不给结论：首字等待、每秒输出、缓存命中率。
+ * 只给三个原始读数，不给结论：本轮步数、每秒输出、缓存命中率。
  * 「偏慢」「缓存命中过低」这类判断从这三个数就能一眼看出，再复述一遍只是噪音。
  *
  * 静默优先：任何异常、定位不到会话、样本太小 —— 都直接 exit 0 什么都不输出，
@@ -18,9 +18,9 @@
  *   CC_TOOLKIT_MIN_TOKENS=30    低于该 token 数不报告
  *   CC_TOOLKIT_VERBOSE=1        把诊断信息写到 stderr（不影响 hook 协议）
  *   CC_TOOLKIT_SHOW=            控制行里包含哪些字段，逗号分隔
- *                               默认 "ttft,decode,cache"
- *                               可选 ttft(首字) decode(每秒输出/纯解码)
- *                                    cache(缓存命中) tps(整轮速度)
+ *                               默认 "steps,decode,cache"
+ *                               可选 steps(本轮步数) decode(每秒输出/纯解码)
+ *                                    cache(缓存命中) tps(整轮速度) ttft(首块等待)
  *                                    median(近期中位) tokens(本轮 token 数)
  *                                    thinking(思维链占比) model effort skill
  *   CC_TOOLKIT_ALERTS=1         打开截断 / refusal / API 重试的额外提示
@@ -45,9 +45,9 @@ const silent = (reason) => {
 /**
  * 把本轮读数拼成一行。
  *
- * 三个字段对应三个正交的事实：等多久、生成多快、prompt 缓存有没有生效。
+ * 三个字段对应三个正交的事实：这一轮有多重、生成多快、prompt 缓存有没有生效。
  * 「每秒输出」用 decodeTps（各步内部的跨度之和）而不是整轮 tps ——
- * 后者含 prefill 与中途的工具执行时间，和「首字」两段会重复计入同一段时间。
+ * 后者含 prefill 与中途的工具执行时间，两段会重复计入同一段时间。
  *
  * 三格**位置固定**：算不出来的那个显示 —，而不是整段消失。
  * 缺一段会让「这一行有几个数」在每轮之间跳变，读者得先数一遍才知道少了什么；
@@ -61,9 +61,16 @@ function composeMessage(round, rollup, opts) {
   const mark = (key) => (f[key] ? "≈" : "");
   const bits = [];
 
+  // 第一格：本轮步数。一轮里模型生成几次、因此过了几轮工具 —— 这是「这一轮有多重」。
+  // 步数来自 message.id 个数，没有估算与精确之分，不参与 ≈ 标记。
+  if (show.has("steps")) {
+    bits.push(round.calls >= 1 ? `${round.calls} 步` : "步数 —");
+  }
+  // ttft 不在默认三格里。它测的是「真人输入 → 首个内容块落盘」，含首块生成时间，
+  // 首块大小在一轮之间差几十倍，跨轮次比较会误导 —— 要看得显式加进 CC_TOOLKIT_SHOW。
   if (show.has("ttft")) {
     bits.push(
-      round.ttftMs != null ? `首字 ${mark("ttft")}${(round.ttftMs / 1000).toFixed(1)}s` : "首字 —"
+      round.ttftMs != null ? `首块 ${mark("ttft")}${(round.ttftMs / 1000).toFixed(1)}s` : "首块 —"
     );
   }
   // decodeTps 已有可测区间时才报；测不出就诚实占位，不拿含 prefill / 工具时间的数冒充
@@ -85,7 +92,7 @@ function composeMessage(round, rollup, opts) {
   // 以下字段默认关着，只有用户显式加进 CC_TOOLKIT_SHOW 才出现。
   // 同样遵循「算不出就占位」：锚点被切掉时整轮耗时无意义，显示 — 而不是 0。
   if (show.has("tps")) {
-    bits.push(round.durMs > 0 ? `整轮 ${mark("ttft")}${round.tps.toFixed(0)} tok/s` : "整轮 —");
+    bits.push(round.durMs > 0 ? `整轮 ${round.tps.toFixed(0)} tok/s` : "整轮 —");
   }
   if (show.has("tokens")) {
     bits.push(`${mark("decode")}${core.formatTokens(round.tokens)} tok`);
@@ -114,6 +121,7 @@ function composeMessage(round, rollup, opts) {
  * 全是 — 的话不如不输出 —— 一行占位符对用户没有信息量。
  */
 function hasAnyRealReading(round, show) {
+  if (show.has("steps") && round.calls >= 1) return true;
   if (show.has("ttft") && round.ttftMs != null) return true;
   if (show.has("decode") && round.decodeTps > 0) return true;
   if (show.has("cache") && round.cache) return true;
@@ -166,7 +174,7 @@ async function main() {
   const minTokens = Number.isFinite(minTokensRaw) && minTokensRaw >= 0 ? minTokensRaw : 30;
   const alertsOn = env.CC_TOOLKIT_ALERTS !== "0";
   const show = new Set(
-    (env.CC_TOOLKIT_SHOW || "ttft,decode,cache")
+    (env.CC_TOOLKIT_SHOW || "steps,decode,cache")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean)

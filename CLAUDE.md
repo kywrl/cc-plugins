@@ -1,7 +1,7 @@
 # cc-plugins
 
 本仓库是 Claude Code 插件市场（market name `cc-plugins`，owner `kywrl`，发布在 `github.com:kywrl/cc-plugins`）。
-目前只含一个插件 `cc-toolkit`（v2.2.0）。
+目前只含一个插件 `cc-toolkit`（v2.4.0）。
 
 ## 仓库形态
 
@@ -122,9 +122,19 @@ claude plugin update cc-toolkit@cc-plugins
 
 | 字段 | 含义 | 口径 |
 | --- | --- | --- |
-| `ttftMs` 首字 | 你按下回车 → 本轮首个内容块落盘 | 含 prefill + 排队 |
+| `calls` 本轮步数 | 轮内 `message.id` 个数（模型生成几次） | 无估算/精确之分，不带 `≈` |
 | `decodeTps` 每秒输出 | 各**步**内部（首块→末块）跨度**之和**，分子分母同源 | 纯解码 |
 | `cache.hitRatio` 缓存命中 | `cache_read / (cache_read + cache_creation + input)` | — |
+
+**默认三格是 `steps,decode,cache`**（`cc-hook.js` 的 `CC_TOOLKIT_SHOW` 默认值）。
+`ttft` 仍可显式要，但 2.4.0 起不再是默认读数 —— 见下面「已退役」。
+
+**已退役：`ttftMs` / 「首字」**（2.4.0）。原实现测「你按下回车 → 本轮首个内容块落盘」，
+那是**等待 + 首块生成时间**的合计，而首块大小在一轮之间差几十倍（实测 ≥1000 字符时
+中位 26–29s，<50 字符时 9–13s），跨轮次比较会把「首块更大」误读成「等得更久」。
+更根本的是模型吐出**第一个 token** 的时刻在块级落盘的日志里不可观测。
+字段与 `ttftMeaningful` / `medianTtftMs` / `MAX_PLAUSIBLE_TTFT_MS` 都已删除；
+词表守卫把 `首字` 列为废弃说法，改文案时别写回去。
 
 `decodeTps` 与整轮 `tps` 是**两个量**：整轮口径含 prefill 与步之间的工具执行时间。
 若用整轮首块→末块当 decode 分母，工具等待会被当成解码时间，实测中位从 128 掉到 10 tok/s。
@@ -157,13 +167,15 @@ claude plugin update cc-toolkit@cc-plugins
 - **三格位置固定**：某一项算不出来就渲染 `—`，不让整段消失。`hasAnyRealReading()` 只在
   三格全空时才静默。
 - **`truncatedAnchor`**：回放窗口从文件中途开始时，本轮的用户行可能被切掉，`durMs`/`tps`
-  的分母少了一整段首字等待（实测 57 → 133 tok/s 的系统性虚高）。这类轮次**不进聚合**。
+  的分母少了一整段起点（实测 57 → 133 tok/s 的系统性虚高）。这类轮次**不进聚合**。
 - **轮次锚点只认真人输入**：`tool_result` 回流与 `isMeta` 技能注入都不算新一轮（见
   `isHumanInput`），拿它们当锚点会把一轮越切越碎。
 - **`null` 与 `0` 语义不同**：`decodeTps: null` 是「测不出来」，`thinkingShare: null` 是
   「provider 没上报这个字段」，都不是 0，渲染时不能混。
-- 时间窗口常量集中在 `cc-core.js` 顶部（`STREAMING_WINDOW_MS`、`MAX_PLAUSIBLE_TTFT_MS`、
-  `MAX_ATTRIBUTION_MS`、`MIN_DECODE_MS`、`LOW_CACHE_HIT_RATIO`）。
+- 时间窗口常量集中在 `cc-core.js` 顶部（`STREAMING_WINDOW_MS`、`MAX_ATTRIBUTION_MS`、
+  `MIN_DECODE_MS`、`LOW_CACHE_HIT_RATIO`、`MAX_STEPS_PER_TURN`）。
+- **步数是轮级量**：`_describe`（步级）里没有 `calls`，渲染时要从 `tracker.currentTurn()`
+  取。`renderLive` / `renderReport` 的 `currentSpeed()` 给的是步级读数 —— 别在那儿读 `calls`。
 
 ## 测试
 

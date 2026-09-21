@@ -73,8 +73,7 @@ if (!picked) {
       if (stats.medianDecodeTps != null) {
         say(
           `   拆分口径：${stats.decodeCount}/${stats.count} 条可算纯解码，` +
-            `中位 ${stats.medianDecodeTps.toFixed(0)} tok/s` +
-            (stats.medianTtftMs != null ? `，首字中位 ${(stats.medianTtftMs / 1000).toFixed(1)}s` : "")
+            `中位 ${stats.medianDecodeTps.toFixed(0)} tok/s`
         );
       } else {
         say(`   ${WARN} 本会话没有可拆分的样本，纯解码速度暂时算不出来`);
@@ -107,7 +106,7 @@ say("输出通道");
 say("────────");
 say(`${OK} Stop hook  : node "${path.join(__dirname, "cc-hook.js")}"`);
 say("   → 由插件的 hooks/hooks.json 自动挂载，无需手工配置。");
-say("     · 每轮回复后显示首字等待 / 每秒输出 / 缓存命中");
+say("     · 每轮回复后显示本轮步数 / 每秒输出 / 缓存命中");
 say("");
 say("   没生效？先确认它到底跑没跑：在会话文件里搜 stop_hook_summary，");
 say("   hookInfos 会列出真正执行过的命令。");
@@ -116,7 +115,7 @@ say("环境变量开关");
 say("────────────");
 say("  CC_TOOLKIT_DISABLE=1             临时关闭");
 say("  CC_TOOLKIT_MIN_TOKENS=30         低于该 token 数的响应不报告");
-say("  CC_TOOLKIT_SHOW=ttft,decode,cache  每轮那行包含哪些字段");
+say("  CC_TOOLKIT_SHOW=steps,decode,cache  每轮那行包含哪些字段");
 say("  CC_TOOLKIT_ALERTS=0              关掉截断 / refusal / 重试的附加提示");
 say("  CC_TOOLKIT_VERBOSE=1             把诊断信息写到 stderr");
 

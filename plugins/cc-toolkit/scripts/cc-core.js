@@ -22,13 +22,17 @@
  *   · decode（写回答）  —— 首块到最后一块之间。
  * 合成一个数字时，prompt 越长读数越低，会被误读成「模型变慢」。所以拆开：
  *
- *   ttftMs     真人输入 → 本轮首个块的间隔（≈ 首字等待，含 prefill +
- *              排队 + 首个 thinking/text 块的生成时间）
  *   decodeTps  纯解码速度。一轮回复里可能有几十上百步，每步单独
  *              测「首块 → 末块」的跨度再求和 —— 步与步之间夹着的工具执行时间
  *              不属于解码，算进去会把读数压低近十倍（实测 128 → 10 tok/s）。
  *              没有任何一步有可测跨度时返回 null，由调用方显示占位符。
  *   tps        整轮 tokens ÷ 整轮耗时（含 prefill 与工具执行），保证可比性。
+ *   calls      本轮步数 —— 这一步数给出「这一轮有多重」。
+ *
+ * 曾报过的 ttftMs（真人输入 → 首个内容块）已退役，理由见 CHANGELOG 2.4.0：
+ * 那一段是**等待 + 首块生成时间**的合计，而首块大小在一轮之间差几十倍
+ *（实测首块 ≥1000 字符时中位 26–29s，<50 字符时 9–13s），
+ * 跨轮次比较时会把「首块更大」误读成「等得更久」。
  *
  * ── 术语：一轮 vs 一步 ─────────────────────────────────────────────────
  *   · 一轮 = 你按下回车 → 这次回复结束。
@@ -76,10 +80,8 @@ const MAX_SAMPLES = 500;
  * 超出只意味着最老的几步不参与轮级聚合 —— 极端防御，不该被触发。
  */
 const MAX_STEPS_PER_TURN = 600;
-/** TTFT 超过这个值就不当作「等待首字」——多半是用户去接水了，不是模型慢 */
-const MAX_PLAUSIBLE_TTFT_MS = 120_000;
 /**
- * 超过这个时长的轮次不参与「TTFT / 缓存命中 / 归因」的聚合。
+ * 超过这个时长的轮次不参与「缓存命中 / 归因」的聚合。
  * 它们仍会进中位数统计（慢是真的慢），但这类轮次里用户离开的时间
  * 会污染那些「该反映模型本事」的指标。
  */
@@ -324,7 +326,7 @@ class SessionTracker {
     this.file = file;
     this.offset = 0;
     this.lastTs = null; // 上一行（任意类型）的时间戳，作为新响应的起点
-    this.lastUserTs = null; // 上一条 user 行的时间戳，作为 TTFT 的锚
+    this.lastUserTs = null; // 上一条 user 行的时间戳
     /**
      * message.id -> 该步的累计量。**这是唯一的按步记账**。
      *
@@ -377,8 +379,8 @@ class SessionTracker {
    * @param {number} startTs 本轮的起点锚（真人输入那一刻）
    * @param {{anchorSeen?: boolean}} [opts]
    *   anchorSeen=false：本轮的起点锚（用户行）落在回放窗口之外，start 只能用
-   *   首个内容块兜底。此时「首字等待」和「整轮耗时」都算不出来（分母少了一整段
-   *   prefill），必须标出来而不是照常输出。
+   *   首个内容块兜底。此时「整轮耗时」算不出来（分母少了一整段 prefill），
+   *   必须标出来而不是照常输出。
    */
   step(id, startTs, { anchorSeen = true } = {}) {
     let g = this.groups.get(id);
@@ -401,7 +403,6 @@ class SessionTracker {
         ts: [],
         firstBlockAt: null,
         lastBlockAt: null,
-        ttftMs: null,
         blocks: 0,
         firstBlockType: null,
         blockTypes: {},
@@ -435,7 +436,7 @@ class SessionTracker {
 
   /**
    * 开一轮新的（用户发了消息）。
-   * @param {number|null} startTs 真人输入那一刻，作为 TTFT 与整轮耗时的锚点
+   * @param {number|null} startTs 真人输入那一刻，作为整轮耗时的锚点
    */
   _openTurn(startTs) {
     if (this.turn) this._archiveTurn();
@@ -473,7 +474,6 @@ class SessionTracker {
 
     let tokens = 0;
     let estimated = false; // 整轮口径：有任何一个数字来自字符估算
-    let estTtft = false;
     let estDecode = false;
     let estCache = false;
     let thinkingTokens = 0; // 取各步的 max（thinking 是 output 的子集，累计会重复）
@@ -513,13 +513,6 @@ class SessionTracker {
       cache1h += c.cache1h;
     }
 
-    // 首字：真人输入 → 本轮第一个内容块。锚点在就是可算的（与用户判断一致）。
-    let ttftMs = null;
-    if (t.start != null && t.firstBlockAt != null) {
-      const gap = t.firstBlockAt - t.start;
-      if (gap >= 0 && gap < MAX_PLAUSIBLE_TTFT_MS) ttftMs = gap;
-    }
-
     const cacheTotal = cacheRead + cacheWrite + fresh;
     const cache = cacheTotal > 0
       ? {
@@ -549,16 +542,11 @@ class SessionTracker {
     return {
       tokens,
       estimated,
-      estimatedFields: { ttft: estTtft, decode: estDecode, cache: estCache },
+      estimatedFields: { decode: estDecode, cache: estCache },
       // partial：这一轮已经结束，但 usage 没落盘，token 数只能靠字符估
       partial: estimated,
       durMs,
       tps,
-      ttftMs,
-      // 首块之后还有多少时间 —— 太短说明「首字」和「整轮」几乎同一个数，
-      // 一起显示只是重复（单块回复时二者完全相等），看起来像算错了。
-      // 与 decode 用同一个下限，保持一致。
-      ttftMeaningful: ttftMs != null && durMs - ttftMs > MIN_DECODE_MS,
       decodeMs: measurableMs > 0 ? measurableMs : null,
       decodeTps,
       decodeReason:
@@ -570,7 +558,7 @@ class SessionTracker {
               ? "not-measurable"
               : "no-usage",
       // 回放窗口从文件中途开始时，本轮的用户行可能已被切掉 —— 锚点没见过，
-      // 首字与整轮耗时都少了一整段，不能当作正常样本。
+      // 整轮耗时少了一整段，不能当作正常样本。
       truncatedAnchor: t.start == null,
       thinkingTokens: think,
       thinkingShare: tokens > 0 && think ? think / tokens : null,
@@ -623,7 +611,7 @@ class SessionTracker {
     this.lastRound = round;
 
     // 统计样本才需要过滤：太短的轮次方差极大，混进中位数/p90 会污染聚合结果。
-    // truncatedAnchor 同理必须排除：那一轮的 durMs 少了一整段首字等待，
+    // truncatedAnchor 同理必须排除：那一轮的 durMs 少了一整段起点，
     // tps 会系统性偏高（实测 57 → 133），是数据缺口造成的假读数。
     if (!round.truncatedAnchor && round.tokens >= MIN_SAMPLE_TOKENS && round.durMs > MIN_SAMPLE_MS) {
       this.samples.push(round);
@@ -671,13 +659,6 @@ class SessionTracker {
       partial: !streaming && estimated,
       durMs,
       tps,
-      // 锚点没见到（本轮的用户行在回放窗口之外）时，firstBlockAt - start 恒为 0，
-      // 报 0 会被渲染成「首字 0.0s」。宁可 null —— 这正是 decodeTps 的处理方式。
-      ttftMs: g.anchorSeen ? g.ttftMs : null,
-      // 单块回复里首块即末块，ttft 恒等于整轮耗时 —— 此时把「首字 X.Xs」
-      // 和「整轮 X.Xs」一起显示只是重复，反而让人以为是 bug。这种轮次
-      // 只在真的存在「首块之后还有内容」时才算有可展示的首字等待。
-      ttftMeaningful: g.anchorSeen && g.ttftMs != null && g.end - g.start - g.ttftMs > MIN_DECODE_MS,
       decodeMs,
       decodeTps,
       // 区分「只有一个块所以拆不了」与「块被一次性写盘、跨度测不出来」
@@ -690,7 +671,7 @@ class SessionTracker {
               ? "not-measurable"
               : "no-usage",
       // truncated-anchor：本轮的起点锚（用户行）没进回放窗口，start 退化成首个
-      // 内容块。此时 durMs/tps 的分母少了一整段首字等待，读数会明显偏高
+      // 内容块。此时 durMs/tps 的分母少了一整段起点，读数会明显偏高
       //（实测同一轮 57 tok/s 被算成 133），不能当作正常样本聚合。
       truncatedAnchor: !g.anchorSeen,
       thinkingTokens,
@@ -886,17 +867,10 @@ class SessionTracker {
 
       // 起点锚是本轮开始前最后见到的那一行的时间戳。回放窗口从文件中途开始时，
       // 本轮的用户行可能已经被切掉、lastTs 还是 null —— 这时 start 只能用
-      // 首个内容块兜底，durMs 会少掉一整段首字等待（见 anchorSeen）。
+      // 首个内容块兜底，整轮耗时会少掉一段（见 anchorSeen）。
       const step = this.step(id, this.lastTs ?? ts ?? Date.now(), {
         anchorSeen: this.lastTs != null,
       });
-
-      // TTFT 只在本轮第一个块落盘时算一次
-      if (step.firstBlockAt == null && ts) {
-        const anchor = step.start;
-        const gap = ts - anchor;
-        if (gap >= 0 && gap < MAX_PLAUSIBLE_TTFT_MS) step.ttftMs = gap;
-      }
 
       // 一行 assistant 记录只需要遍历一次：步记录与轮聚合要的量都从这里取。
       // 跑两遍循环去喂两份记录，是两份记账迟早对不齐的根源。
@@ -1013,7 +987,6 @@ class SessionTracker {
 
     // 只有 ≥2 个内容块的轮次才算得出纯 decode 速度，样本天然更少
     const decodeRows = rows.filter((d) => d.decodeTps > 0);
-    const ttftRows = rows.filter((d) => d.ttftMs >= 0 && d.ttftMs != null);
 
     return {
       count: rows.length,
@@ -1027,9 +1000,6 @@ class SessionTracker {
       // 纯解码口径
       decodeCount: decodeRows.length,
       medianDecodeTps: median(decodeRows.map((d) => d.decodeTps)),
-      // 首字等待口径
-      medianTtftMs: median(ttftRows.map((d) => d.ttftMs)),
-      p90TtftMs: percentile(ttftRows.map((d) => d.ttftMs), 90),
     };
   }
 
@@ -1058,7 +1028,6 @@ class SessionTracker {
             count: list.length,
             medianTps: median(list.map((d) => d.tps)),
             medianDecodeTps: median(dec),
-            medianTtftMs: median(list.filter((d) => d.ttftMs != null).map((d) => d.ttftMs)),
             medianTokens: median(list.map((d) => d.tokens)),
           };
         })
@@ -1149,12 +1118,10 @@ class SessionTracker {
     const rows = samples || this.recentSamples();
     const recent = rows.slice(-9);
     const dec = recent.filter((d) => d.decodeTps > 0).map((d) => d.decodeTps);
-    const ttfts = recent.filter((d) => d.ttftMs != null).map((d) => d.ttftMs);
     const caches = recent.filter((d) => d.cache).map((d) => d.cache.hitRatio);
     return {
       median: median(recent.map((d) => d.tps)),
       medianDecode: median(dec),
-      medianTtftMs: median(ttfts),
       medianCacheHit: median(caches),
       count: recent.length,
     };
@@ -1266,8 +1233,11 @@ function renderLive(tracker, now = Date.now()) {
       `${c.speed}⚡ ${mark}${snap.tps.toFixed(0)} tok/s${c.reset}` +
       `${c.dim} ${snap.streaming ? "本轮" : "最近一轮"}${c.reset} ` +
       `${mark}${formatTokens(snap.tokens)} tok${c.dim}·${secs(snap.durMs)}${c.reset}`;
-    // 拆出首字等待与纯解码速度：整轮 tps 里混着 prefill，单看它会误判
-    if (snap.ttftMeaningful) seg += `${c.dim} 首字 ${secs(snap.ttftMs)}${c.reset}`;
+    // 本轮步数：给出「这一轮有多重」（模型生成了几次、因此过了几轮工具）。
+    // 步数是**轮级**量，得从 currentTurn 取 —— currentSpeed 给的是步级读数，
+    // 那里没有也不该有 calls。
+    const turn = tracker.currentTurn();
+    if (turn && turn.calls > 1) seg += `${c.dim} ${turn.calls} 步${c.reset}`;
     if (snap.decodeTps > 0) seg += `${c.dim} 解码 ${Math.round(snap.decodeTps)}${c.reset}`;
     parts.push(seg);
   } else {
@@ -1322,8 +1292,10 @@ function renderReport(tracker, { history = 10 } = {}) {
       `当前${snap.streaming ? "（流式进行中）" : "（最近一轮，已结束）"}: ` +
         `${mark}${snap.tps.toFixed(0)} tok/s  ${mark}${formatTokens(snap.tokens)} tok / ${secs(snap.durMs)}`
     );
+    // 步数是轮级量（见 renderLive 的说明），单独一行给
+    const turn = tracker.currentTurn();
+    if (turn) lines.push(`  本轮 ${turn.calls} 步`);
     const bits = [];
-    if (snap.ttftMeaningful) bits.push(`首字 ${secs(snap.ttftMs)}`);
     if (snap.decodeTps > 0) bits.push(`解码 ${Math.round(snap.decodeTps)} tok/s${snap.decodeMs ? ` (跨 ${secs(snap.decodeMs)})` : ""}`);
     if (bits.length) lines.push(`  拆分: ${bits.join(" · ")}`);
     if (snap.cache) lines.push(`  缓存命中 ${pct(snap.cache.hitRatio)}`);
@@ -1344,12 +1316,10 @@ function renderReport(tracker, { history = 10 } = {}) {
   lines.push(`最近 ${rows.length} 条已完成的响应:`);
   for (const d of rows) {
     const mark = d.estimated ? "≈" : " ";
-    // 首字与解码成对出现：只有真的测出了解码区间，首字等待才是可解释的信息
     const dec = d.decodeTps > 0 ? ` 解码${String(Math.round(d.decodeTps)).padStart(4)}` : "        ";
-    const ttft = d.ttftMeaningful ? ` 首字${(d.ttftMs / 1000).toFixed(1)}s` : "";
     lines.push(
       `  ${hhmmss(d.at)} ${mark}${String(Math.round(d.tokens)).padStart(5)} tok / ` +
-        `${secs(d.durMs).padStart(6)} = ${d.tps.toFixed(0).padStart(4)} tok/s${dec}${ttft}` +
+        `${secs(d.durMs).padStart(6)} = ${d.tps.toFixed(0).padStart(4)} tok/s${dec}` +
         (d.stoppedByLimit ? "  [截断]" : d.refused ? "  [拒答]" : "")
     );
   }
@@ -1362,11 +1332,8 @@ function renderReport(tracker, { history = 10 } = {}) {
     const unmeasurable = s.count - s.decodeCount;
     lines.push(
       `纯解码口径（${s.decodeCount}/${s.count} 条可拆分）: 中位 ${s.medianDecodeTps.toFixed(0)} tok/s` +
-        (s.medianTtftMs != null ? ` | 首字中位 ${secs(s.medianTtftMs)}` : "") +
         (unmeasurable ? ` | ${unmeasurable} 条无法拆分` : "")
     );
-  } else if (s.medianTtftMs != null) {
-    lines.push(`首字中位 ${secs(s.medianTtftMs)}（本窗口没有可拆分 decode 的样本）`);
   }
   return lines.join("\n");
 }

@@ -1,5 +1,5 @@
 ---
-description: 查看输出速度统计 (tok/s)：当前一轮 + 首字等待/纯解码拆分 + 最近若干条已完成响应 + 趋势与分布
+description: 查看输出速度统计 (tok/s)：当前一轮（含本轮步数）+ 纯解码拆分 + 最近若干条已完成响应（按步）+ 趋势与分布
 argument-hint: "[要显示的最近响应条数，默认 10；可写 --all 回放整个会话文件；--insights 看分层归因]"
 allowed-tools: Bash(node:*)
 disable-model-invocation: true
@@ -28,9 +28,11 @@ disable-model-invocation: true
 
 ### 读这些指标时要注意的口径
 
-- **整轮 tps 与纯解码 decodeTps 不是同一个量。** 整轮里混着 prefill（读 prompt）。
-  实测首字等待中位 7.3s，prompt 越长这个数越大。所以「整轮变慢」很可能只是
-  prompt 变长，不是模型解码变慢 —— 两个口径的趋势方向不一致时，就是这个原因。
+- **整轮 tps 与纯解码 decodeTps 不是同一个量。** 整轮里混着 prefill（读 prompt）与各步之间的工具执行。
+  所以「整轮变慢」很可能只是 prompt 变长或工具变多，不是模型解码变慢 ——
+  两个口径的趋势方向不一致时，多半就是这个原因。
+- **本轮步数**是轮级量（这一轮模型生成几次）。样本列表按步切分，所以每行都恰好是一步、
+  不再单列步数；步数只在「当前一轮」那一行出现。
 - **decodeTps 显示 null 是正常的**，表示这一步没有可测的解码区间（单个内容块，
   或多个块被一次性写盘、时间戳只差几毫秒）。不要把它读成 0 或很快。
 - **thinking 占比为 null** 表示当前 provider/CLI 版本不在 usage 里上报

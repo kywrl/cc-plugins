@@ -209,7 +209,7 @@ test("SessionTracker: 一轮里的多步被聚合成一个整体", () => {
   assert.equal(r.calls, 3, "三步属于同一轮");
   assert.ok(r.tokens >= 300, "tokens 应是整轮聚合，不是最后一个 id 的 0");
   assert.ok(r.cache === null, "没有缓存字段时如实返回 null");
-  assert.ok(r.ttftMs != null, "首字以真人输入为锚，恒可算");
+  assert.equal(r.calls, 3, "三步都算进了本轮");
 });
 
 test("SessionTracker: 聚合解码跨度时逐次测量，不把工具执行时间算进去", () => {
@@ -305,8 +305,10 @@ test("SessionTracker: 工具结果与技能注入不作为轮次锚点", () => {
 
   const r = new core.SessionTracker(file).start().latestRound({ force: true });
   assert.equal(r.calls, 2, "两步都在同一轮里（没被 tool_result 切开）");
-  // 锚点仍是 t0 那个真人输入 → 首字 2000ms，而不是 1000ms 或 500ms
-  assert.equal(r.ttftMs, 2000, "锚点应是最初的真人输入，不是 tool_result / isMeta 行");
+  // 锚点仍是 t0 那个真人输入：末块在 t0+3000 → 整轮 3000ms，
+  // 而不是从 tool_result（t0+1000）或 a2 的块（t0+2000）起算。
+  // 锚点划错会让整轮耗时系统性偏短 —— 这正是轮次锚点只认真人输入的原因。
+  assert.equal(r.durMs, 3000, "锚点应是最初的真人输入，不是 tool_result / isMeta 行");
 });
 
 
@@ -561,7 +563,7 @@ test("hook: 短回复（低于统计下限但高于 CC_TOOLKIT_MIN_TOKENS）仍�
   });
   assert.notEqual(out, "", "短回复不该静默");
   const payload = JSON.parse(out);
-  assert.match(payload.systemMessage, /首字 0\.8s/, "应带首字等待");
+  assert.match(payload.systemMessage, /1 步/, "应带本轮步数");
   assert.match(payload.systemMessage, /每秒输出 \d+ tok\/s/, "应带每秒输出");
 });
 
@@ -574,14 +576,14 @@ test("hook: 三个字段用 | 分隔，且不带「本轮」「⚡」这类前�
     input: JSON.stringify({ session_id: "fmt", transcript_path: file }),
   });
   const msg = JSON.parse(out).systemMessage;
-  assert.equal(msg, "首字 0.8s | 每秒输出 250 tok/s | 缓存命中 92%", "三段读数，| 分隔");
+  assert.equal(msg, "1 步 | 每秒输出 250 tok/s | 缓存命中 92%", "三段读数，| 分隔");
   assert.doesNotMatch(msg, /本轮/, "不该再有「本轮」");
   assert.doesNotMatch(msg, /⚡/, "不该再有 ⚡ 前缀");
   assert.doesNotMatch(msg, /·/, "分隔符应为 |");
 });
 
-test("hook: 「每秒输出」用纯解码口径，扣掉首字等待", () => {
-  // 3 个块、每块间隔 800ms：整轮 2.4s、首字 0.8s，纯解码跨度只有 1.6s。
+test("hook: 「每秒输出」用纯解码口径，扣掉第一段等待", () => {
+  // 3 个块、每块间隔 800ms：整轮 2.4s、首段等待 0.8s，纯解码跨度只有 1.6s。
   // 400 tok / 1.6s = 250 tok/s；若误用整轮口径会得到 167。
   const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }], { name: "decode-session.jsonl" });
   const out = run("cc-hook.js", [], {
@@ -589,7 +591,7 @@ test("hook: 「每秒输出」用纯解码口径，扣掉首字等待", () => {
   });
   const msg = JSON.parse(out).systemMessage;
   assert.match(msg, /每秒输出 250 tok\/s/, "应是纯解码速度，不是含 prefill 的整轮速度");
-  assert.doesNotMatch(msg, /每秒输出 167 tok\/s/, "整轮口径会重复计入首字等待");
+  assert.doesNotMatch(msg, /每秒输出 167 tok\/s/, "整轮口径会重复计入第一段等待");
 });
 
 test("hook: 测不出纯解码时显示 — 占位，不拿整轮速度冒充", () => {
@@ -606,7 +608,7 @@ test("hook: 测不出纯解码时显示 — 占位，不拿整轮速度冒充", 
   assert.match(msg, /每秒输出 —/, "拆不出来就占位，而不是退回含 prefill 的数");
   assert.doesNotMatch(msg, /每秒输出 \d/, "不该有假的解码速度");
   assert.match(msg, /缓存命中 92%/, "其余字段照常");
-  assert.match(msg, /首字 [\d.]+s/, "首字照常");
+  assert.match(msg, /1 步/, "步数照常");
   assert.equal(msg.split(" | ").length, 3, "三格位置固定，缺一不可");
 });
 
@@ -618,7 +620,7 @@ test("hook: CC_TOOLKIT_SHOW 能裁剪输出行", () => {
   });
   const msg = JSON.parse(out).systemMessage;
   assert.match(msg, /整轮 \d+ tok\/s/);
-  assert.doesNotMatch(msg, /首字/, "首字不在 show 里就不该出现");
+  assert.doesNotMatch(msg, /步/, "步数不在 show 里就不该出现");
   assert.doesNotMatch(msg, /每秒输出/, "每秒输出不在 show 里就不该出现");
   assert.doesNotMatch(msg, /缓存命中/, "缓存不在 show 里就不该出现");
   assert.doesNotMatch(msg, /近\d+条中位/, "median 不在 show 里就不该出现");
@@ -700,19 +702,18 @@ test("hook: CC_TOOLKIT_MIN_TOKENS 高于本轮时仍然静默", () => {
   assert.equal(out, "", "用户把下限调到 100，46 tok 就该静默");
 });
 
-test("SessionTracker: 拆分首字等待(TTFT)与纯解码速度", () => {
+test("SessionTracker: 区分整轮口径与纯解码速度（首段等待不计入 decode）", () => {
   // 3 个块，每块间隔 800ms：整轮 2.4s / 400 tok = 167 tok/s，
-  // 但首字等了 800ms，真正的解码跨度只有 1.6s → 250 tok/s。
+  // 但第一段等了 800ms，真正的解码跨度只有 1.6s → 250 tok/s。
   // 合成一个数字时，这个差别会被完全掩盖。
   const file = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }]);
   const tracker = new core.SessionTracker(file).start();
   const r = tracker.latestRound({ force: true });
 
   assert.equal(r.durMs, 2400);
-  assert.equal(r.ttftMs, 800, "首字等待 = 本轮起点 → 第一个块");
-  assert.equal(r.decodeMs, 1600, "解码跨度 = 首块 → 末块");
-  assert.equal(Math.round(r.tps), 167, "整轮口径含 prefill");
-  assert.equal(Math.round(r.decodeTps), 250, "纯解码口径不含 prefill");
+  assert.equal(r.decodeMs, 1600, "解码跨度 = 首块 → 末块，不含首段等待");
+  assert.equal(Math.round(r.tps), 167, "整轮口径含首段等待");
+  assert.equal(Math.round(r.decodeTps), 250, "纯解码口径不含首段等待");
   assert.ok(r.decodeTps > r.tps, "拆开后解码速度应高于合成值");
 });
 
@@ -729,18 +730,20 @@ test("SessionTracker: 单块回复无法拆分 decode，decodeTps 为 null", () 
   assert.ok(r.tps > 0, "整轮速度仍然可用");
 });
 
-test("SessionTracker: 单块回复的首字等待被标记为无意义", () => {
-  // 单块回复里首块即末块，ttft 恒等于整轮耗时。把它和「整轮 2.0s」一起显示
-  // 只是重复，看起来像算错了 —— 所以标记出来，由渲染层决定不显示。
+test("SessionTracker: 本轮步数 = 该轮的步记录个数", () => {
+  // 步数回答「这一轮有多重」：模型生成了几次、因此过了几轮工具。
+  // 单步与多步都要如实报出，它是三格里的第一格。
   const single = writeTranscript([{ id: "m", ms: 2000, tokens: 400, chunks: 1 }]);
   const r1 = new core.SessionTracker(single).start().latestRound({ force: true });
-  assert.equal(r1.ttftMs, 2000, "首字等待等于整轮耗时");
-  assert.equal(r1.ttftMeaningful, false, "没有后续内容 → 首字等待无展示意义");
+  assert.equal(r1.calls, 1, "一条 message.id = 一步");
 
-  // 多个块、跨度足够时才有意义
-  const multi = writeTranscript([{ id: "m", ms: 2400, tokens: 400, chunks: 3 }]);
+  const multi = writeMultiCallTurn([
+    { id: "c1", blocks: 2, tokens: 300, ms: 1000 },
+    { id: "c2", blocks: 2, tokens: 0, ms: 1000 }, // 无 usage 的步也要计数
+    { id: "c3", blocks: 2, tokens: 0, ms: 1000 },
+  ]);
   const r2 = new core.SessionTracker(multi).start().latestRound({ force: true });
-  assert.equal(r2.ttftMeaningful, true);
+  assert.equal(r2.calls, 3, "三个 message.id = 三步，与是否带 usage 无关");
 });
 
 test("SessionTracker: 块被一次性写盘时不报解码速度", () => {
@@ -776,15 +779,13 @@ test("SessionTracker: 块被一次性写盘时不报解码速度", () => {
   assert.equal(r.decodeTps, null, "跨度太短 → 不报解码速度");
   assert.equal(r.decodeReason, "not-measurable");
   assert.ok(r.tps < 1000, "整轮口径不会被这种轮次污染");
-  assert.equal(r.ttftMeaningful, false);
+  assert.equal(r.calls, 1, "块被一次性写盘不影响步数");
 });
 
-test("SessionTracker: 回放窗口切断起点锚时，首字与整轮速度都算不出来", () => {
-  // 状态栏只回放末尾 400KB，切点可能落在某一轮的用户行与其首个内容块之间。
-  // 锚点没了，start 只能用首个内容块兜底 —— 这时：
-  //   · firstBlockAt - start 恒为 0，报 0 会被渲染成「首字 0.0s」；
-  //   · durMs 少掉一整段首字等待，tps 系统性偏高。
-  // 两者都必须标成「测不出来」，而不是给假读数。
+test("SessionTracker: 回放窗口切断起点锚时，整轮速度算不出来", () => {
+  // 回放窗口（末尾 2MB）的切点可能落在某一轮的用户行与其首个内容块之间。
+  // 锚点没了，start 只能用首个内容块兜底 —— durMs 少掉一整段等待，
+  // tps 会系统性偏高（实测 57 → 133）。必须标成「测不出来」，而不是给假读数。
   const dir = fs.mkdtempSync(path.join(tmpRoot, "anchor-"));
   const file = path.join(dir, "anchor.jsonl");
   const t0 = Date.parse("2026-01-01T00:00:00Z");
@@ -819,10 +820,8 @@ test("SessionTracker: 回放窗口切断起点锚时，首字与整轮速度都�
     .latestRound({ force: true });
 
   assert.ok(r, "被切断锚点的那一轮仍要能作为「最新一轮」读到");
-  assert.equal(r.ttftMs, null, "锚点没见到就不该报 0 —— 那会被渲染成「首字 0.0s」");
-  assert.equal(r.ttftMeaningful, false, "测不出来的首字不该展示");
   assert.equal(r.truncatedAnchor, true, "要标出这一轮的锚点被窗口切掉了");
-  // 锚点是整轮耗时与首字的分母。锚点没了，这两个数就都失去意义 ——
+  // 锚点是整轮耗时的分母。锚点没了，这个数就失去意义 ——
   // 旧的实现会用首个内容块兜底 start，得出一个系统性偏高的 tps；
   // 现在干脆不给数（durMs=0 → tps=0），由渲染层显示 —。
   assert.equal(r.durMs, 0, "没有锚点就没有可信的整轮耗时");
@@ -831,13 +830,12 @@ test("SessionTracker: 回放窗口切断起点锚时，首字与整轮速度都�
   // 对照：完整读到用户行时一切正常
   const ok = new core.SessionTracker(file).start({ replayTailBytes: 1e9 }).latestRound({ force: true });
   assert.equal(ok.truncatedAnchor, false);
-  assert.equal(ok.ttftMs, 3000);
   // 锚点在 t0，末块在 t0+6000 → 整轮 6s / 400 tok = 67 tok/s
   assert.equal(Math.round(ok.tps), 67, "整轮 6s / 400 tok");
 });
 
 test("SessionTracker: 锚点被切断的轮次不进统计聚合", () => {
-  // 它的 tps 分母少了一段首字等待，混进中位数会系统性偏高。
+  // 它的 tps 分母少了一段起点，混进中位数会系统性偏高。
   // 让被切断的那一轮**归档**（后面再出现新的 message.id），它才会走到样本过滤器 ——
   // 否则它只是「当前轮」，测不到这条过滤。
   const dir = fs.mkdtempSync(path.join(tmpRoot, "anchanchor-"));
@@ -894,7 +892,7 @@ test("SessionTracker: 锚点被切断的轮次不进统计聚合", () => {
     "锚点被切断的轮次不该出现在统计样本里（它的 tps 分母是错的）"
   );
 
-  // 但它仍要能作为「最新一轮」被读到（只不过首字会标成测不出来）
+  // 但它仍要能作为「最新一轮」被读到（只不过整轮耗时算不出来）
   const latest = tracker.latestRound({ force: true });
   assert.ok(latest, "被切断锚点的那一轮仍要能读到");
 });
@@ -1151,7 +1149,7 @@ test("CLI --json: 带上分层指标与会话级事实", () => {
   const eff = data.breakdown.byEffort.find((g) => g.key === "high");
   assert.ok(eff, "应按 effort 分组");
   assert.equal(eff.count, 4);
-  assert.ok(eff.medianTtftMs != null, "分组里应带首字等待");
+
   assert.equal(data.samples[0].cacheHitRatio, 0.9, "缓存命中率应被解析出来（9000/10000）");
   assert.equal(data.sessionFacts.cache.sampleCount, 4);
   assert.equal(data.sessionFacts.anomalies.maxTokens, 0);
@@ -1213,7 +1211,7 @@ test("hook: 收到事件后输出 {systemMessage}，且不含 extra 字段", () 
   // Stop hook 是控制类 hook，不接受 decision/continue，只回 systemMessage 最安全
   assert.equal(Object.keys(payload).length, 1);
   // 三格位置固定：这份夹具没有缓存字段，末格显示 — 而不是消失
-  assert.match(payload.systemMessage, /^首字 [\d.]+s \| 每秒输出 \d+ tok\/s \| 缓存命中 —$/);
+  assert.match(payload.systemMessage, /^1 步 \| 每秒输出 \d+ tok\/s \| 缓存命中 —$/);
 });
 
 test("hook: stop_hook_active 时静默，防止递归", () => {
@@ -1390,6 +1388,20 @@ test("词表一致性: 文档与描述里不再出现已废弃的说法", () => 
     {
       re: /首末内容块间隔|首末块间隔/,
       why: "2.2.0 起 decode 的判据是「各次调用跨度之和」，不是整轮首末块间隔",
+    },
+    // 2.3.0 把 TTFT 从默认三格里退役，并改名为「首块」。原实现测的是
+    // 「真人输入 → 本轮首个内容块落盘」，含**首块自身的生成时间**；
+    // 首块大小在一轮之间差几十倍（实测 ≥1000 字符时中位 26–29s，
+    // <50 字符时 9–13s），跨轮次比较会把「首块更大」误读成「等得更久」。
+    // 「首字」（模型响应的第一个 token）在块级落盘的日志里不可观测，
+    // 拿它命名会让人以为测的是那个。
+    {
+      re: /首字/,
+      why: "2.3.0 起「首字」退役：块级日志测不到第一个 token，那个位置只能测到首块落盘",
+    },
+    {
+      re: /首字等待|TTFT/,
+      why: "2.3.0 起改称「首块等待」，且不再是默认读数 —— 它含首块生成时间",
     },
   ];
 

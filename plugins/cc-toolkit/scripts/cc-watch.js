@@ -89,9 +89,8 @@ function buildJson(tracker, opts) {
     tokens: Math.round(d.tokens),
     seconds: Number((d.durMs / 1000).toFixed(2)),
     estimated: d.estimated,
-    ttftMs: d.ttftMs == null ? null : Math.round(d.ttftMs),
-    ttftMeaningful: !!d.ttftMeaningful,
-    // true = 本轮的起点锚落在回放窗口之外，tps / ttft 都是算不出来的
+    calls: d.calls,
+    // true = 本轮的起点锚落在回放窗口之外，tps 是算不出来的
     truncatedAnchor: !!d.truncatedAnchor,
     decodeTps: d.decodeTps > 0 ? Number(d.decodeTps.toFixed(2)) : null,
     decodeMs: d.decodeMs == null ? null : Math.round(d.decodeMs),
@@ -121,8 +120,6 @@ function buildJson(tracker, opts) {
           worst: Number(s.worst.tps.toFixed(2)),
           medianDecodeTps: s.medianDecodeTps == null ? null : Number(s.medianDecodeTps.toFixed(2)),
           decodeCount: s.decodeCount,
-          medianTtftMs: s.medianTtftMs == null ? null : Math.round(s.medianTtftMs),
-          p90TtftMs: s.p90TtftMs == null ? null : Math.round(s.p90TtftMs),
         }
       : null;
 
